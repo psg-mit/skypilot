@@ -16,6 +16,7 @@ from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
 from sky.clouds import cloud as sky_cloud
+from sky.clouds.utils import gcp_utils
 from sky.provision import docker_utils
 from sky.provision.gcp import constants as gcp_constants
 from sky.provision.kubernetes import utils as kubernetes_utils
@@ -913,6 +914,38 @@ class Resources:
                 raise ValueError(
                     f'The "memory" field should be positive. Found: {memory!r}')
 
+    def _validate_compute_tpu_args(self, acc: str,
+                                   accelerator_args: Dict[str, Any]) -> None:
+        """Checks accelerator_args for a TPU of the Compute Engine API."""
+        assert self.cloud is not None
+        if not self.cloud.is_same_cloud(clouds.GCP()):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'accelerator_args.api: compute is only supported on '
+                    f'GCP, got {self.cloud}.')
+        tpu_api_only_args = ('tpu_vm', 'runtime_version', 'tpu_name',
+                             'gcp_queued_resource')
+        for key in tpu_api_only_args:
+            if key in accelerator_args:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'accelerator_args.{key} belongs to the TPU API and '
+                        'cannot be combined with accelerator_args.api: '
+                        'compute.')
+        machine_type = gcp_utils.get_tpu_machine_type(acc)
+        if machine_type is None:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    f'{acc} has no single-host Compute Engine machine type. '
+                    'accelerator_args.api: compute supports: '
+                    f'{", ".join(gcp_utils.TPU_MACHINE_TYPES)}.')
+        if (self.instance_type is not None and
+                self.instance_type != machine_type):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(f'The Compute Engine machine type of {acc} is '
+                                 f'{machine_type}, got instance_type '
+                                 f'{self.instance_type!r}.')
+
     def _set_accelerators(
         self,
         accelerators: Union[None, str, Dict[str, Union[int, float]]],
@@ -973,11 +1006,17 @@ class Resources:
 
                 if accelerator_args is None:
                     accelerator_args = {}
+                if (gcp_utils.is_tpu_machine_type(self.instance_type) and
+                        'api' not in accelerator_args):
+                    # A TPU machine type implies the Compute Engine API.
+                    accelerator_args['api'] = gcp_utils.TPU_API_COMPUTE
 
+                tpu_api = accelerator_args.get('api', gcp_utils.TPU_API_TPU)
                 use_tpu_vm = accelerator_args.get('tpu_vm', True)
-                if (self.cloud.is_same_cloud(clouds.GCP()) and
-                        not kubernetes_utils.is_tpu_on_gke(acc,
-                                                           normalize=False)):
+                if tpu_api == gcp_utils.TPU_API_COMPUTE:
+                    self._validate_compute_tpu_args(acc, accelerator_args)
+                elif (self.cloud.is_same_cloud(clouds.GCP()) and
+                      not kubernetes_utils.is_tpu_on_gke(acc, normalize=False)):
                     if 'runtime_version' not in accelerator_args:
 
                         def _get_default_runtime_version() -> str:

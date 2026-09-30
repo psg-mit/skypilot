@@ -26,12 +26,77 @@ if typing.TYPE_CHECKING:
 
 logger = sky_logging.init_logger(__name__)
 
+# The `api` key of `accelerator_args` selects the API that provisions a TPU.
+TPU_API_TPU = 'tpu'
+TPU_API_COMPUTE = 'compute'
+TPU_APIS = (TPU_API_TPU, TPU_API_COMPUTE)
+
+# Single-host TPU slices in the accelerator-optimized machine family of the
+# Compute Engine API, keyed by the accelerator name used in the TPU API.
+# Reference: https://cloud.google.com/compute/docs/tpus/tpu-machines
+TPU_MACHINE_TYPES: Dict[str, str] = {
+    'tpu-v5p-8': 'ct5p-hightpu-4t',
+    'tpu-v5litepod-1': 'ct5lp-hightpu-1t',
+    'tpu-v5litepod-4': 'ct5lp-hightpu-4t',
+    'tpu-v5litepod-8': 'ct5lp-hightpu-8t',
+    'tpu-v6e-1': 'ct6e-standard-1t',
+    'tpu-v6e-4': 'ct6e-standard-4t',
+    'tpu-v6e-8': 'ct6e-standard-8t',
+}
+TPU_MACHINE_TYPE_TO_ACC: Dict[str, str] = {
+    machine_type: acc for acc, machine_type in TPU_MACHINE_TYPES.items()
+}
+# machine type -> (vCPUs, memory in GiB). The Compute Engine machine type
+# catalog (machineTypes.list) is the source of truth; these values fill the
+# rows in when the hosted catalog has no entry for the machine type.
+TPU_MACHINE_TYPE_SPECS: Dict[str, Tuple[int, int]] = {
+    'ct5p-hightpu-4t': (208, 448),
+    'ct5lp-hightpu-1t': (24, 48),
+    'ct5lp-hightpu-4t': (112, 192),
+    'ct5lp-hightpu-8t': (224, 384),
+    'ct6e-standard-1t': (44, 176),
+    'ct6e-standard-4t': (180, 720),
+    'ct6e-standard-8t': (360, 1440),
+}
+# Machine series that carry TPUs. Their host price is included in the TPU
+# SKU, and Compute Engine does not live-migrate them.
+TPU_MACHINE_SERIES = ('ct5p', 'ct5lp', 'ct6e')
+
+
+def is_tpu_machine_type(instance_type: Optional[str]) -> bool:
+    """Returns whether instance_type is a Compute Engine TPU machine type."""
+    if instance_type is None:
+        return False
+    return instance_type.split('-')[0] in TPU_MACHINE_SERIES
+
+
+def get_tpu_machine_type(acc_name: str) -> Optional[str]:
+    """Returns the Compute Engine machine type for a single-host TPU slice."""
+    return TPU_MACHINE_TYPES.get(acc_name)
+
 
 def is_tpu(resources: Optional['resources_lib.Resources']) -> bool:
     if resources is None or resources.accelerators is None:
         return False
     acc, _ = list(resources.accelerators.items())[0]
     return acc.startswith('tpu')
+
+
+def is_compute_tpu(resources: Optional['resources_lib.Resources']) -> bool:
+    """Returns whether the TPU is provisioned through the Compute Engine API.
+
+    This is the case when `accelerator_args.api` is `compute`, or when the
+    instance type is a TPU machine type such as `ct5p-hightpu-4t`.
+    """
+    if resources is None:
+        return False
+    if is_tpu_machine_type(resources.instance_type):
+        return True
+    if not is_tpu(resources):
+        return False
+    if resources.accelerator_args is None:
+        return False
+    return resources.accelerator_args.get('api', TPU_API_TPU) == TPU_API_COMPUTE
 
 
 def is_tpu_vm(resources: Optional['resources_lib.Resources']) -> bool:
@@ -42,9 +107,17 @@ def is_tpu_vm(resources: Optional['resources_lib.Resources']) -> bool:
     acc, _ = list(resources.accelerators.items())[0]
     if kubernetes_utils.is_tpu_on_gke(acc, normalize=False):
         return False
+    if is_compute_tpu(resources):
+        return False
     if resources.accelerator_args is None:
         return True
     return resources.accelerator_args.get('tpu_vm', True)
+
+
+def is_tpu_node(resources: Optional['resources_lib.Resources']) -> bool:
+    """Returns whether the TPU is a TPU Node attached to a separate host VM."""
+    return (is_tpu(resources) and not is_tpu_vm(resources) and
+            not is_compute_tpu(resources))
 
 
 def is_tpu_vm_pod(resources: Optional['resources_lib.Resources']) -> bool:

@@ -11,6 +11,7 @@ from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.catalog import common
 from sky.clouds import GCP
+from sky.clouds.utils import gcp_utils
 from sky.utils import resources_utils
 from sky.utils import ux_utils
 
@@ -29,8 +30,82 @@ logger = sky_logging.init_logger(__name__)
 # every 7 hours to make sure we have the latest information.
 _PULL_FREQUENCY_HOURS = 7
 
-_df = common.read_catalog('gcp/vms.csv',
-                          pull_frequency_hours=_PULL_FREQUENCY_HOURS)
+_hosted_df = common.read_catalog('gcp/vms.csv',
+                                 pull_frequency_hours=_PULL_FREQUENCY_HOURS)
+
+
+def add_tpu_machine_type_rows(df: 'pd.DataFrame') -> 'pd.DataFrame':
+    """Adds host rows for the Compute Engine TPU machine types.
+
+    The hosted catalog lists a single-host TPU slice, e.g. `tpu-v5p-8`, as an
+    accelerator row without a host VM. The Compute Engine API provisions the
+    same slice as a machine type, e.g. `ct5p-hightpu-4t`. This adds one host
+    row per zone that offers the slice, so that the machine type resolves
+    like the a2/a3/g2 GPU machine types do. The TPU accelerator row already
+    carries the price of the whole machine, so the host row costs 0.
+    Zones that already have a row for the machine type are left as they are.
+    """
+    if df.empty or 'AcceleratorName' not in df.columns:
+        return df
+    new_rows = []
+    for acc_name, machine_type in gcp_utils.TPU_MACHINE_TYPES.items():
+        tpu_rows = df[(df['AcceleratorName'] == acc_name) &
+                      (df['InstanceType'].isna())]
+        if tpu_rows.empty:
+            continue
+        existing_zones = set(df.loc[df['InstanceType'] == machine_type,
+                                    'AvailabilityZone'])
+        vcpus, memory = gcp_utils.TPU_MACHINE_TYPE_SPECS[machine_type]
+        zones = tpu_rows[['Region', 'AvailabilityZone'
+                         ]].drop_duplicates().itertuples(index=False)
+        for region, zone in zones:
+            if zone in existing_zones:
+                continue
+            new_rows.append({
+                'InstanceType': machine_type,
+                'vCPUs': float(vcpus),
+                'MemoryGiB': float(memory),
+                'Region': region,
+                'AvailabilityZone': zone,
+                'Price': 0.0,
+                'SpotPrice': 0.0,
+            })
+    if not new_rows:
+        return df
+    return pd.concat([df, pd.DataFrame(new_rows, columns=df.columns)],
+                     ignore_index=True)
+
+
+class _CatalogWithTPUMachineTypes:
+    """The hosted VM catalog plus the rows from add_tpu_machine_type_rows.
+
+    The rows are recomputed only when the hosted catalog is reloaded.
+    """
+
+    def __init__(self, hosted_df: common.LazyDataFrame):
+        self._hosted_df = hosted_df
+        self._source: Optional['pd.DataFrame'] = None
+        self._df: Optional['pd.DataFrame'] = None
+
+    def _load_df(self) -> 'pd.DataFrame':
+        # pylint: disable=protected-access
+        source = self._hosted_df._load_df()
+        if self._df is None or source is not self._source:
+            self._source = source
+            self._df = add_tpu_machine_type_rows(source)
+        return self._df
+
+    def __getattr__(self, name: str):
+        return getattr(self._load_df(), name)
+
+    def __getitem__(self, key):
+        return self._load_df()[key]
+
+    def __setitem__(self, key, value):
+        self._load_df()[key] = value
+
+
+_df = _CatalogWithTPUMachineTypes(_hosted_df)
 _image_df = common.read_catalog('gcp/images.csv',
                                 pull_frequency_hours=_PULL_FREQUENCY_HOURS)
 
@@ -332,9 +407,10 @@ def get_accelerators_from_instance_type(
     """
     if instance_type in GCP_ACC_INSTANCE_TYPES:
         return _INSTANCE_TYPE_TO_ACC[instance_type]
-    else:
-        # General CPU instance types don't come with pre-attached accelerators.
-        return None
+    if instance_type in gcp_utils.TPU_MACHINE_TYPE_TO_ACC:
+        return {gcp_utils.TPU_MACHINE_TYPE_TO_ACC[instance_type]: 1}
+    # General CPU instance types don't come with pre-attached accelerators.
+    return None
 
 
 def get_instance_type_for_accelerator(
@@ -409,6 +485,27 @@ def get_region_zones_for_instance_type(instance_type: str,
                                        use_spot: bool) -> List['cloud.Region']:
     df = _df[_df['InstanceType'] == instance_type]
     return common.get_region_zones(df, use_spot)
+
+
+def get_tpu_machine_type_for_accelerator(
+        acc_name: str,
+        acc_count: int,
+        cpus: Optional[str] = None,
+        memory: Optional[str] = None) -> Optional[str]:
+    """Returns the Compute Engine machine type for a single-host TPU slice.
+
+    Returns None when the slice has no machine type, when acc_count is not 1,
+    or when the machine type does not satisfy the requested cpus and memory.
+    """
+    if acc_count != 1:
+        return None
+    machine_type = gcp_utils.get_tpu_machine_type(acc_name)
+    if machine_type is None:
+        return None
+    df = _df[_df['InstanceType'] == machine_type]
+    if df.empty:
+        return None
+    return common.get_instance_type_for_cpus_mem_impl(df, cpus, memory)
 
 
 def _get_accelerator(
@@ -603,6 +700,8 @@ def check_accelerator_attachable_to_host(instance_type: str,
         if instance_type in GCP_ACC_INSTANCE_TYPES:
             # Infer the GPU type from the instance type
             accelerators = _INSTANCE_TYPE_TO_ACC[instance_type]
+        elif instance_type in gcp_utils.TPU_MACHINE_TYPE_TO_ACC:
+            accelerators = {gcp_utils.TPU_MACHINE_TYPE_TO_ACC[instance_type]: 1}
         else:
             # Skip the following checks if instance_type is a general CPU
             # instance without accelerators
@@ -620,6 +719,16 @@ def check_accelerator_attachable_to_host(instance_type: str,
                 'See \'sky gpus list --cloud gcp\'')
 
     if acc_name.startswith('tpu-'):
+        if gcp_utils.is_tpu_machine_type(instance_type):
+            expected = gcp_utils.get_tpu_machine_type(acc_name)
+            if instance_type != expected or acc_count != 1:
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.ResourcesMismatchError(
+                        f'{acc_name}:{acc_count} is not the TPU slice of '
+                        f'machine type {instance_type}. The machine type '
+                        f'for {acc_name} is {expected}. Please refer to: '
+                        'https://cloud.google.com/compute/docs/tpus/tpu-machines')  # pylint: disable=line-too-long
+            return
         if instance_type != 'TPU-VM' and not instance_type.startswith('n1-'):
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.ResourcesMismatchError(

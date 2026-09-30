@@ -537,6 +537,12 @@ def _get_single_resources_schema():
                     'gcp_queued_resource': {
                         'type': 'boolean',
                     },
+                    # Which GCP API provisions a TPU: the TPU API (default)
+                    # or the Compute Engine API with TPU machine types.
+                    'api': {
+                        'type': 'string',
+                        'enum': ['tpu', 'compute'],
+                    },
                 }
             },
             '_no_missing_accel_warnings': {
