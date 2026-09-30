@@ -1291,17 +1291,17 @@ class GCP(clouds.Cloud):
             # a3-ultragpu, n4, a4, and g4 instances only support
             # hyperdisk-balanced.
             _propagate_disk_type(all='hyperdisk-balanced')
-        if series in ('ct5p', 'ct6e'):
-            # TPU v5p and v6e machine types boot from Hyperdisk Balanced.
-            # v6e does not support Persistent Disk at all.
+        if series == 'ct6e':
+            # TPU v6e machine types boot from Hyperdisk Balanced and do not
+            # support Persistent Disk.
             # Reference: https://cloud.google.com/compute/docs/tpus/tpu-machines
             _propagate_disk_type(all='hyperdisk-balanced')
-        if series == 'ct5lp':
-            # TPU v5e machine types support neither pd-standard nor
-            # pd-extreme.
-            _propagate_disk_type(
-                lowest=tier2name[resources_utils.DiskTier.MEDIUM],
-                highest=tier2name[resources_utils.DiskTier.HIGH])
+        if series in ('ct5p', 'ct5lp'):
+            # TPU v5p machine types reject Hyperdisk ('hyperdisk-balanced
+            # disk type cannot be used by ct5p-hightpu-4t machine type') and
+            # boot from Balanced Persistent Disk. v5e machine types are
+            # treated the same way.
+            _propagate_disk_type(all='pd-balanced')
 
         # Series specific handling
         if series == 'n2':

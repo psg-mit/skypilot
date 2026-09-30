@@ -317,7 +317,7 @@ def test_deploy_variables_and_template(use_spot):
     assert variables['docker_run_options'] == ['--privileged']
     assert variables['image_id'].endswith(
         'images/family/ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e')
-    assert variables['disk_tier'] == 'hyperdisk-balanced'
+    assert variables['disk_tier'] == 'pd-balanced'
 
     rendered = _render_node_config(variables)
     assert 'machineType: ct5p-hightpu-4t' in rendered
@@ -338,10 +338,10 @@ def test_deploy_variables_tpu_vm_unchanged():
 
 @pytest.mark.parametrize('instance_type, expected', [
     ('ct5p-hightpu-4t', {
-        resources_utils.DiskTier.LOW: 'hyperdisk-balanced',
-        resources_utils.DiskTier.MEDIUM: 'hyperdisk-balanced',
-        resources_utils.DiskTier.HIGH: 'hyperdisk-balanced',
-        resources_utils.DiskTier.ULTRA: 'hyperdisk-balanced',
+        resources_utils.DiskTier.LOW: 'pd-balanced',
+        resources_utils.DiskTier.MEDIUM: 'pd-balanced',
+        resources_utils.DiskTier.HIGH: 'pd-balanced',
+        resources_utils.DiskTier.ULTRA: 'pd-balanced',
     }),
     ('ct6e-standard-8t', {
         resources_utils.DiskTier.LOW: 'hyperdisk-balanced',
@@ -349,9 +349,7 @@ def test_deploy_variables_tpu_vm_unchanged():
     }),
     ('ct5lp-hightpu-4t', {
         resources_utils.DiskTier.LOW: 'pd-balanced',
-        resources_utils.DiskTier.MEDIUM: 'pd-balanced',
-        resources_utils.DiskTier.HIGH: 'pd-ssd',
-        resources_utils.DiskTier.ULTRA: 'pd-ssd',
+        resources_utils.DiskTier.ULTRA: 'pd-balanced',
     }),
 ])
 def test_boot_disk_types(instance_type, expected):
