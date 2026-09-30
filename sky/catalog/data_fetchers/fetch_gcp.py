@@ -19,6 +19,7 @@ import numpy as np
 
 from sky.adaptors import common as adaptors_common
 from sky.adaptors import gcp
+from sky.clouds.utils import gcp_utils
 from sky.utils import annotations
 from sky.utils import common_utils
 
@@ -186,6 +187,12 @@ SERIES_TO_DESCRIPTION = {
     # instances. The B200 GPU SKU includes the full VM cost. See special
     # handling in get_vm_price() which sets A4 VM price to 0.
     'a4': 'A4 Instance',
+    # NOTE: The host of a TPU machine type is priced in the TPU SKU
+    # (TpuV5p, TpuV5e, TpuV6e), which the accelerator rows carry. See
+    # get_vm_price(), which sets the host price of these series to 0.
+    'ct5lp': 'TpuV5e',
+    'ct5p': 'TpuV5p',
+    'ct6e': 'TpuV6e',
     'c2': 'Compute optimized',
     'c2d': 'C2D AMD Instance',
     'c3': 'C3 Instance',
@@ -350,11 +357,20 @@ def get_vm_df(skus: List[Dict[str, Any]], region_prefix: str) -> 'pd.DataFrame':
     # Drop the unsupported series.
     df = df[df['InstanceType'].str.startswith(
         tuple(f'{series}-' for series in SERIES_TO_DESCRIPTION))]
+    # Keep only the TPU machine types that map to a single-host TPU slice.
+    df = df[~df['InstanceType'].str.startswith(
+        tuple(f'{series}-' for series in gcp_utils.TPU_MACHINE_SERIES)) |
+            df['InstanceType'].isin(gcp_utils.TPU_MACHINE_TYPE_TO_ACC)]
     df = df[~df['AvailabilityZone'].str.startswith(tuple(TPU_V4_ZONES))]
 
     # TODO(woosuk): Make this more efficient.
     def get_vm_price(row: pd.Series, spot: bool) -> Optional[float]:
         series = row['InstanceType'].split('-')[0].lower()
+
+        # The TPU SKU prices the whole TPU machine, and the TPU accelerator
+        # row carries that price. The host row costs 0, as for A4.
+        if series in gcp_utils.TPU_MACHINE_SERIES:
+            return 0.0
 
         ondemand_or_spot = 'OnDemand' if not spot else 'Preemptible'
         cpu_price = None

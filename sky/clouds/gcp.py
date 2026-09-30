@@ -130,6 +130,13 @@ _DEFAULT_GPU_K80_IMAGE_ID = 'skypilot:k80-debian-10'
 # Need to contact GCP support to build our own image for GPUDirect-TCPX support.
 # Refer to https://github.com/GoogleCloudPlatform/cluster-toolkit/blob/main/examples/machine-learning/a3-highgpu-8g/README.md#before-starting
 _DEFAULT_GPU_DIRECT_IMAGE_ID = 'skypilot:gpu-direct-cos'
+# Ubuntu 22.04 image with the TPU runtime for TPU machine types of the
+# Compute Engine API (v5e, v5p, and v6e). Image families resolve to the
+# latest image at launch time.
+# Reference: https://cloud.google.com/tpu/docs/tpu-os-images
+_DEFAULT_TPU_MACHINE_IMAGE_ID = (
+    'projects/ubuntu-os-accelerator-images/global/images/family/'
+    'ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e')
 
 
 def _run_output(cmd):
@@ -252,7 +259,7 @@ class GCP(clouds.Cloud):
                     'https://cloud.google.com/tpu/docs/managing-tpus-tpu-vm#stopping_your_resources'
                 )
             }
-        if gcp_utils.is_tpu(resources) and not gcp_utils.is_tpu_vm(resources):
+        if gcp_utils.is_tpu_node(resources):
             # TPU node does not support multi-node.
             unsupported[clouds.CloudImplementationFeatures.MULTI_NODE] = (
                 'TPU node does not support multi-node. Please set '
@@ -419,6 +426,11 @@ class GCP(clouds.Cloud):
         return find_machine is not None
 
     @classmethod
+    def _is_image_family(cls, image_id: str) -> bool:
+        find_family = re.match(r'projects/.*/global/images/family/.*', image_id)
+        return find_family is not None
+
+    @classmethod
     @annotations.lru_cache(scope='global', maxsize=1)
     def _get_image_size(cls, image_id: str) -> float:
         if image_id.startswith('skypilot:'):
@@ -450,6 +462,13 @@ class GCP(clouds.Cloud):
                 # storageLocations.
                 return float(
                     image_infos['instanceProperties']['disks'][0]['diskSizeGb'])
+            elif cls._is_image_family(image_id):
+                start = time.time()
+                image_infos = compute.images().getFromFamily(
+                    project=project, family=image_name).execute()
+                logger.debug(
+                    f'GCP image family get took {time.time() - start:.2f}s')
+                return float(image_infos['diskSizeGb'])
             else:
                 start = time.time()
                 image_infos = compute.images().get(project=project,
@@ -563,6 +582,7 @@ class GCP(clouds.Cloud):
             'gpu_count': None,
             'tpu': None,
             'tpu_vm': False,
+            'compute_tpu': False,
             'custom_resources': None,
             'use_spot': r.use_spot,
             'gcp_project_id': self.get_project_id(dryrun),
@@ -587,7 +607,15 @@ class GCP(clouds.Cloud):
             resources_vars['custom_resources'] = json.dumps(accelerators,
                                                             separators=(',',
                                                                         ':'))
-            if 'tpu' in acc:
+            if gcp_utils.is_compute_tpu(r):
+                # A TPU machine type of the Compute Engine API. The TPUs come
+                # with the machine type; no TPU API resource is created.
+                resources_vars['compute_tpu'] = True
+                image_id = _DEFAULT_TPU_MACHINE_IMAGE_ID
+                # Docker containers need privileged mode to access the TPU
+                # devices.
+                resources_vars['docker_run_options'] = ['--privileged']
+            elif 'tpu' in acc:
                 resources_vars['tpu_type'] = acc.replace('tpu-', '')
                 assert r.accelerator_args is not None, r
 
@@ -655,7 +683,7 @@ class GCP(clouds.Cloud):
 
         # For TPU nodes. TPU VMs do not need TPU_NAME.
         tpu_node_name = resources_vars.get('tpu_node_name')
-        if gcp_utils.is_tpu(resources) and not gcp_utils.is_tpu_vm(resources):
+        if gcp_utils.is_tpu_node(resources):
             if tpu_node_name is None:
                 tpu_node_name = cluster_name.name_on_cloud
 
@@ -774,15 +802,20 @@ class GCP(clouds.Cloud):
                   ) == 1, 'cannot handle more than one accelerator candidates.'
         acc, acc_count = list(resources.accelerators.items())[0]
         use_tpu_vm = gcp_utils.is_tpu_vm(resources)
+        use_compute_tpu = gcp_utils.is_compute_tpu(resources)
 
-        # For TPU VMs, the instance type is fixed to 'TPU-VM'. However, we still
-        # need to call the below function to get the fuzzy candidate list.
+        # For TPU VMs, the instance type is fixed to 'TPU-VM', and for TPUs
+        # of the Compute Engine API it is the TPU machine type. The TPU rows
+        # of the catalog carry no vCPU or memory, so the cpus and memory are
+        # checked against the host below instead. We still need to call the
+        # below function to get the fuzzy candidate list.
+        host_fixed = use_tpu_vm or use_compute_tpu
         (instance_list,
          fuzzy_candidate_list) = catalog.get_instance_type_for_accelerator(
              acc,
              acc_count,
-             cpus=resources.cpus if not use_tpu_vm else None,
-             memory=resources.memory if not use_tpu_vm else None,
+             cpus=resources.cpus if not host_fixed else None,
+             memory=resources.memory if not host_fixed else None,
              use_spot=resources.use_spot,
              local_disk=resources.local_disk,
              region=resources.region,
@@ -797,7 +830,18 @@ class GCP(clouds.Cloud):
             instance_list
         ) == 1, f'More than one instance type matched, {instance_list}'
 
-        if use_tpu_vm:
+        if use_compute_tpu:
+            # pylint: disable=import-outside-toplevel
+            # sky.catalog.gcp_catalog imports this module.
+            from sky.catalog import gcp_catalog
+            machine_type = gcp_catalog.get_tpu_machine_type_for_accelerator(
+                acc, acc_count, resources.cpus, resources.memory)
+            if machine_type is None:
+                return resources_utils.FeasibleResources([],
+                                                         fuzzy_candidate_list,
+                                                         None)
+            host_vm_type = machine_type
+        elif use_tpu_vm:
             host_vm_type = 'TPU-VM'
             # FIXME(woosuk, wei-lin): This leverages the fact that TPU VMs
             # have 96 vCPUs, and 240 vCPUs for tpu-v4. We need to move
@@ -1247,6 +1291,17 @@ class GCP(clouds.Cloud):
             # a3-ultragpu, n4, a4, and g4 instances only support
             # hyperdisk-balanced.
             _propagate_disk_type(all='hyperdisk-balanced')
+        if series in ('ct5p', 'ct6e'):
+            # TPU v5p and v6e machine types boot from Hyperdisk Balanced.
+            # v6e does not support Persistent Disk at all.
+            # Reference: https://cloud.google.com/compute/docs/tpus/tpu-machines
+            _propagate_disk_type(all='hyperdisk-balanced')
+        if series == 'ct5lp':
+            # TPU v5e machine types support neither pd-standard nor
+            # pd-extreme.
+            _propagate_disk_type(
+                lowest=tier2name[resources_utils.DiskTier.MEDIUM],
+                highest=tier2name[resources_utils.DiskTier.HIGH])
 
         # Series specific handling
         if series == 'n2':

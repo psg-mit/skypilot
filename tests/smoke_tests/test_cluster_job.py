@@ -1150,6 +1150,36 @@ def test_tpu_vm():
     smoke_tests_utils.run_one_test(test)
 
 
+# ---------- TPU as a Compute Engine machine type. ----------
+@pytest.mark.gcp
+@pytest.mark.tpu
+def test_tpu_compute_api():
+    """A single-host TPU slice provisioned with accelerator_args.api: compute.
+
+    The slice is a ct5p-hightpu-4t instance, so it can be stopped and
+    restarted like any other VM.
+    """
+    name = smoke_tests_utils.get_cluster_name()
+    test = smoke_tests_utils.Test(
+        'tpu_compute_api',
+        [
+            f'sky launch -y -c {name} examples/tpu/compute_tpu_jax.yaml',
+            f'sky logs {name} 1',  # Ensure the job finished.
+            f'sky logs {name} 1 --status',  # Ensure the job succeeded.
+            # The launched instance type is the TPU machine type.
+            f's=$(sky status {name}); echo "$s"; echo "$s" | grep {name} | grep ct5p-hightpu-4t',  # pylint: disable=line-too-long
+            f'sky stop -y {name}',
+            f's=$(sky status {name} --refresh); echo "$s"; echo; echo; echo "$s"  | grep {name} | grep STOPPED',  # Ensure the cluster is STOPPED.  # pylint: disable=line-too-long
+            f'sky start --retry-until-up -y {name}',
+            f'sky exec {name} examples/tpu/compute_tpu_jax.yaml',
+            f'sky logs {name} 2 --status',  # Ensure the job succeeded.
+        ],
+        f'sky down -y {name}',
+        timeout=30 * 60,
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
 # ---------- TPU VM Pod. ----------
 @pytest.mark.skip(reason='We are having trouble getting TPUs in GCP.')
 @pytest.mark.gcp

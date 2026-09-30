@@ -12,6 +12,7 @@ import uuid
 from sky import sky_logging
 from sky.adaptors import gcp
 from sky.clouds import gcp as gcp_cloud
+from sky.clouds.utils import gcp_utils
 from sky.provision import common
 from sky.provision import constants as provision_constants
 from sky.provision.gcp import constants
@@ -876,6 +877,12 @@ class GCPComputeInstance(GCPInstance):
         #    source specified'
         # https://cloud.google.com/compute/docs/reference/rest/v1/instances/bulkInsert # pylint: disable=line-too-long
         if config.get('sourceMachineImage') is not None:
+            return False
+        # TPU machine types are created one instance at a time with insert(),
+        # the path validated for single-host slices. Multi-host slices need
+        # bulkInsert together with a workload policy, which is not supported
+        # yet.
+        if gcp_utils.is_tpu_machine_type(config.get('machineType')):
             return False
         # bulkInsert does not support attaching existing
         # disks to the instances with READ_WRITE mode.
