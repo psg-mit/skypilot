@@ -1,0 +1,38 @@
+# A single-host TPU slice provisioned as a Compute Engine machine type
+# (accelerator_args.api: compute) instead of a Cloud TPU API resource.
+# tpu-v5p-8 maps to ct5p-hightpu-4t, which has 4 TPU chips.
+#
+# Usage:
+#   sky launch -c tpu-compute examples/tpu/compute_tpu_jax.yaml
+#   sky launch -c tpu-compute examples/tpu/compute_tpu_jax.yaml --gpus tpu-v6e-4
+name: compute_tpu_jax
+
+resources:
+  infra: gcp
+  accelerators: tpu-v5p-8
+  accelerator_args:
+    api: compute
+  use_spot: true
+
+setup: |
+  conda activate jax
+  if [ $? -eq 0 ]; then
+    echo 'conda env exists'
+  else
+    conda create -n jax python=3.10 -y
+    conda activate jax
+    pip install uv
+    uv pip install "jax[tpu]" \
+      -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+  fi
+
+run: |
+  conda activate jax
+  python3 -c '
+  import jax
+  devices = jax.devices()
+  print(devices)
+  assert devices[0].platform == "tpu", devices
+  x = jax.numpy.arange(len(devices))
+  print(jax.pmap(lambda v: v * 2)(x))
+  '
