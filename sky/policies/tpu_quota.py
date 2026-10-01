@@ -36,12 +36,18 @@ a parked request from a user within their share is admitted before a request
 that would take its user over their share, so borrowed capacity flows back as
 soon as it frees up. Only admission is enforced: nobody is preempted to
 reclaim a share.
+
+Admission is serialized across the executor workers with a distributed lock,
+and an admitted request records its demand on its own request row until its
+cluster or managed job shows up in the state above. Concurrent requests
+therefore see each other's demand and cannot jointly exceed the pool.
 """
 import ast
 import dataclasses
+import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sky import admin_policy
 from sky import core
@@ -52,6 +58,8 @@ from sky.jobs.server import core as managed_jobs_core
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
 from sky.utils import common
+from sky.utils import common_utils
+from sky.utils import locks
 from sky.utils import status_lib
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
@@ -61,6 +69,8 @@ logger = sky_logging.init_logger(__name__)
 DEFAULT_QUOTA_FILE = '~/.sky/tpu_quota.yaml'
 QUOTA_FILE_ENV_VAR = 'SKYPILOT_TPU_QUOTA_FILE'
 RETRY_WAIT_SECONDS = 60
+ADMISSION_LOCK_ID = 'tpu_quota_admission'
+ADMISSION_LOCK_TIMEOUT_SECONDS = 30
 
 UNIT_CHIPS = 'chips'
 UNIT_SLICES = 'slices'
@@ -80,6 +90,11 @@ _ACC_DEMAND_RE = re.compile(r'(tpu-[a-z0-9]+-\d+):(\d+)')
 # can see which family it waits for and whether it is within its share. The
 # executor keeps the first 200 characters of the reason in the status message.
 _WAITING_MARKER_RE = re.compile(r'\[tpu-quota (\S+) (under|over)-share\]')
+# An admitted request's status message starts with this marker, followed by
+# the JSON reservation (see ``_record_admission``). The executor clears the
+# status message when a request starts running, so a request that is still
+# waiting for the admission lock carries no reservation.
+_ADMITTED_MARKER = '[tpu-quota admitted]'
 
 Usage = Dict[str, int]
 
@@ -210,9 +225,15 @@ def _cluster_accelerators(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def current_usage(unit: str) -> Tuple[Dict[str, Usage], Usage]:
-    """TPU usage per user and in total, from clusters and managed jobs."""
+    """TPU usage per user and in total.
+
+    Counts the clusters and managed jobs of all users, plus the reservations
+    of admitted launch requests whose cluster or job is not visible yet.
+    """
     by_user: Dict[str, Usage] = {}
     total: Usage = {}
+    visible_clusters: Set[str] = set()
+    visible_jobs: Set[str] = set()
 
     def _account(user: Optional[str], accelerators: Dict[str, Any],
                  num_nodes: int) -> None:
@@ -225,6 +246,7 @@ def current_usage(unit: str) -> Tuple[Dict[str, Usage], Usage]:
         if status not in (status_lib.ClusterStatus.UP,
                           status_lib.ClusterStatus.INIT):
             continue
+        visible_clusters.add(str(record.get('name')))
         accelerators = _cluster_accelerators(record)
         if not accelerators:
             continue
@@ -237,6 +259,7 @@ def current_usage(unit: str) -> Tuple[Dict[str, Usage], Usage]:
                 status,
                 managed_job_state.ManagedJobStatus) and status.is_terminal():
             continue
+        visible_jobs.add(str(record.get('job_name')))
         accelerators = record.get('accelerators')
         num_nodes = 1
         if not accelerators:
@@ -251,14 +274,93 @@ def current_usage(unit: str) -> Tuple[Dict[str, Usage], Usage]:
         if not accelerators:
             continue
         _account(record.get('user_name'), accelerators, num_nodes)
+
+    for reservation in pending_reservations(visible_clusters, visible_jobs):
+        if reservation.get('unit') != unit:
+            logger.warning(f'Ignoring a TPU reservation in {reservation!r}: '
+                           f'the quota unit is now {unit}.')
+            continue
+        user_usage = by_user.setdefault(str(reservation.get('user') or ''), {})
+        for family, amount in reservation.get('demand', {}).items():
+            user_usage[family] = user_usage.get(family, 0) + int(amount)
+            total[family] = total.get(family, 0) + int(amount)
     return by_user, total
 
 
-def _parked_requests() -> List[api_requests.Request]:
+def _gated_requests_with_status(
+        status: api_requests.RequestStatus) -> List[api_requests.Request]:
     return api_requests.get_request_tasks(
         api_requests.RequestTaskFilter(
-            status=[api_requests.RequestStatus.WAITING],
+            status=[status],
             include_request_names=[name.value for name in _GATED_REQUESTS]))
+
+
+def _parked_requests() -> List[api_requests.Request]:
+    return _gated_requests_with_status(api_requests.RequestStatus.WAITING)
+
+
+def _running_requests() -> List[api_requests.Request]:
+    return _gated_requests_with_status(api_requests.RequestStatus.RUNNING)
+
+
+def _record_admission(user: str, unit: str, demand: Usage,
+                      cluster_name: Optional[str],
+                      job_name: Optional[str]) -> None:
+    """Stores the admitted demand on the current request.
+
+    The reservation is counted by ``current_usage`` until the launched
+    cluster (or managed job, matched by name) is visible, or until the
+    request leaves the RUNNING status. Outside of a request context (unit
+    tests, in-process launches) there is no request row to write to.
+    """
+    if not common_utils.is_in_request_context():
+        return
+    reservation = {
+        'user': user,
+        'unit': unit,
+        'demand': demand,
+        'cluster': cluster_name,
+        'job': job_name,
+    }
+    with api_requests.update_request(
+            common_utils.get_current_request_id()) as request:
+        if request is None:
+            return
+        request.status_msg = f'{_ADMITTED_MARKER} {json.dumps(reservation)}'
+
+
+def pending_reservations(visible_clusters: Set[str],
+                         visible_jobs: Set[str]) -> List[Dict[str, Any]]:
+    """Reservations of admitted requests that are not yet visible as usage.
+
+    A reservation whose cluster or job name is visible is dropped: the
+    cluster or job records already count it.
+    """
+    current_id = common_utils.get_current_request_id()
+    reservations = []
+    for request in _running_requests():
+        if request.request_id == current_id:
+            continue
+        status_msg = request.status_msg or ''
+        if not status_msg.startswith(_ADMITTED_MARKER):
+            continue
+        try:
+            reservation = json.loads(status_msg[len(_ADMITTED_MARKER):])
+        except ValueError:
+            logger.warning(f'Request {request.request_id} carries a '
+                           f'malformed TPU reservation: {status_msg!r}')
+            continue
+        if reservation.get('cluster') in visible_clusters:
+            continue
+        if reservation.get('job') in visible_jobs:
+            continue
+        reservations.append(reservation)
+    return reservations
+
+
+def _admission_lock() -> locks.DistributedLock:
+    return locks.get_lock(ADMISSION_LOCK_ID,
+                          timeout=ADMISSION_LOCK_TIMEOUT_SECONDS)
 
 
 def under_share_waiters(family: str, user_id: str) -> List[str]:
@@ -307,6 +409,22 @@ class TPUQuotaPolicy(admin_policy.AdminPolicy):
 
         assert user_request.user is not None, (
             'Failed to get the user initiating the request.')
+        try:
+            with _admission_lock():
+                cls._admit(user_request, quota, demand)
+        except locks.LockTimeout:
+            cls._park('Waiting for the TPU quota admission lock.')
+        return passthrough
+
+    @classmethod
+    def _admit(cls, user_request: admin_policy.UserRequest, quota: Quota,
+               demand: Usage) -> None:
+        """Parks the request unless it fits; records the admission otherwise.
+
+        Runs under the admission lock, so the usage read here cannot change
+        before the reservation is recorded.
+        """
+        assert user_request.user is not None
         user = user_request.user.name or ''
         by_user, total = current_usage(quota.unit)
         for family, amount in demand.items():
@@ -336,7 +454,11 @@ class TPUQuotaPolicy(admin_policy.AdminPolicy):
                 logger.info(f'User {user} borrows {amount} {family} '
                             f'{quota.unit}: {mine} + {amount} > share {limit}, '
                             f'pool {used} + {amount} <= {pool}.')
-        return passthrough
+        cluster_name = None
+        if user_request.request_options is not None:
+            cluster_name = user_request.request_options.cluster_name
+        _record_admission(user, quota.unit, demand, cluster_name,
+                          user_request.task.name)
 
     @staticmethod
     def _park(message: str) -> None:

@@ -1,5 +1,7 @@
 """Tests for sky.policies.tpu_quota."""
 # pylint: disable=redefined-outer-name
+import contextlib
+import json
 from unittest import mock
 
 import pytest
@@ -13,8 +15,11 @@ from sky.clouds.gcp import GCP
 from sky.jobs import state as managed_job_state
 from sky.policies import tpu_quota
 from sky.server.requests import request_names
+from sky.server.requests import requests as api_requests
 from sky.utils import admin_policy_utils
+from sky.utils import common_utils
 from sky.utils import config_utils
+from sky.utils import locks
 from sky.utils import status_lib
 
 _LIMITS = {
@@ -37,10 +42,12 @@ _LIMITS = {
 def _cluster(user: str,
              accelerators: dict,
              num_nodes: int = 1,
-             status=status_lib.ClusterStatus.UP) -> dict:
+             status=status_lib.ClusterStatus.UP,
+             name: str = 'cluster') -> dict:
     handle = mock.MagicMock()
     handle.launched_resources.accelerators = accelerators
     return {
+        'name': name,
         'user_name': user,
         'status': status,
         'num_nodes': num_nodes,
@@ -50,8 +57,14 @@ def _cluster(user: str,
 
 def _job(user: str,
          resources: str,
-         status=managed_job_state.ManagedJobStatus.PENDING) -> dict:
-    return {'user_name': user, 'status': status, 'resources': resources}
+         status=managed_job_state.ManagedJobStatus.PENDING,
+         name: str = 'job') -> dict:
+    return {
+        'job_name': name,
+        'user_name': user,
+        'status': status,
+        'resources': resources
+    }
 
 
 def _request(user: str,
@@ -59,6 +72,7 @@ def _request(user: str,
              num_nodes: int = 1,
              request_name=request_names.AdminPolicyRequestName.CLUSTER_LAUNCH,
              at_client_side: bool = False,
+             cluster_name=None,
              **resources_kwargs) -> admin_policy.UserRequest:
     if isinstance(accelerators, list):
         resources = [
@@ -70,9 +84,17 @@ def _request(user: str,
                                             accelerators=accelerators,
                                             **resources_kwargs)
     task = sky.Task(num_nodes=num_nodes).set_resources(resources)
+    request_options = None
+    if cluster_name is not None:
+        request_options = admin_policy.RequestOptions(
+            cluster_name=cluster_name,
+            idle_minutes_to_autostop=None,
+            down=False,
+            dryrun=False)
     return admin_policy.UserRequest(task=task,
                                     skypilot_config=config_utils.Config(),
                                     request_name=request_name,
+                                    request_options=request_options,
                                     at_client_side=at_client_side,
                                     user=models.User(id='h', name=user))
 
@@ -90,15 +112,57 @@ def quota_file(tmp_path, monkeypatch):
     return write
 
 
+class _FakeLock:
+    """Records acquisitions; never blocks."""
+
+    def __init__(self):
+        self.held = False
+        self.acquisitions = 0
+
+    def __enter__(self):
+        assert not self.held, 'the admission lock is not reentrant'
+        self.held = True
+        self.acquisitions += 1
+        return self
+
+    def __exit__(self, *exc):
+        self.held = False
+
+
 @pytest.fixture
 def usage(monkeypatch):
-    """Sets the clusters and managed jobs the policy sees."""
-    state = {'clusters': [], 'jobs': []}
+    """Sets the clusters, jobs and requests the policy sees.
+
+    ``admitted`` collects the reservations the policy records, each tagged
+    with whether the admission lock was held at the time.
+    """
+    state = {
+        'clusters': [],
+        'jobs': [],
+        'parked': [],
+        'running': [],
+        'admitted': [],
+        'lock': _FakeLock(),
+    }
     monkeypatch.setattr(tpu_quota, '_cluster_records',
                         lambda: state['clusters'])
     monkeypatch.setattr(tpu_quota, '_job_records', lambda: state['jobs'])
-    state['parked'] = []
     monkeypatch.setattr(tpu_quota, '_parked_requests', lambda: state['parked'])
+    monkeypatch.setattr(tpu_quota, '_running_requests',
+                        lambda: state['running'])
+    monkeypatch.setattr(tpu_quota, '_admission_lock', lambda: state['lock'])
+
+    def record(user, unit, demand, cluster_name, job_name):
+        state['admitted'].append({
+            'user': user,
+            'unit': unit,
+            'demand': demand,
+            'cluster': cluster_name,
+            'job': job_name,
+            'locked': state['lock'].held,
+        })
+
+    monkeypatch.setattr(tpu_quota, '_record_admission', record)
     return state
 
 
@@ -106,6 +170,29 @@ def _parked(user_id: str, status_msg: str):
     request = mock.MagicMock()
     request.request_id = f'req-{user_id}-{len(status_msg)}'
     request.user_id = user_id
+    request.status_msg = status_msg
+    return request
+
+
+def _running(request_id: str,
+             user: str = None,
+             demand: dict = None,
+             cluster: str = None,
+             job: str = None,
+             unit: str = 'chips',
+             status_msg: str = None):
+    """A RUNNING launch request, admitted unless ``status_msg`` is given."""
+    request = mock.MagicMock()
+    request.request_id = request_id
+    if status_msg is None:
+        reservation = {
+            'user': user,
+            'unit': unit,
+            'demand': demand,
+            'cluster': cluster,
+            'job': job,
+        }
+        status_msg = f'[tpu-quota admitted] {json.dumps(reservation)}'
     request.status_msg = status_msg
     return request
 
@@ -213,8 +300,20 @@ def _apply(req):
 def test_admits_within_share(quota_file, usage):
     quota_file(_LIMITS)
     usage['clusters'] = [_cluster('alice', {'tpu-v5p-8': 1})]
-    result = _apply(_request('alice', 'tpu-v5p-8'))
+    result = _apply(_request('alice', 'tpu-v5p-8', cluster_name='c2'))
     assert result.task is not None
+    # The admission is recorded under the lock, keyed by the cluster name.
+    assert usage['admitted'] == [{
+        'user': 'alice',
+        'unit': 'chips',
+        'demand': {
+            'v5p': 4
+        },
+        'cluster': 'c2',
+        'job': None,
+        'locked': True,
+    }]
+    assert usage['lock'].acquisitions == 1
 
 
 def test_admits_borrowing_while_pool_has_room(quota_file, usage):
@@ -350,3 +449,140 @@ def test_paused_error_propagates_through_admin_policy_utils(
     with pytest.raises(exceptions.UserRequestRejectedByPolicy):
         admin_policy_utils.apply(
             task, request_names.AdminPolicyRequestName.CLUSTER_LAUNCH)
+
+
+def test_parked_request_records_no_admission(quota_file, usage):
+    quota_file({'unit': 'chips', 'pool': {'v5p': 4}, 'per_user': {}})
+    usage['clusters'] = [_cluster('alice', {'tpu-v5p-8': 1})]
+    with pytest.raises(exceptions.ExecutionPausedError):
+        _apply(_request('bob', 'tpu-v5p-8'))
+    assert usage['admitted'] == []
+    assert usage['lock'].acquisitions == 1
+    assert not usage['lock'].held
+
+
+def test_passthrough_skips_the_lock(quota_file, usage):
+    quota_file(_LIMITS)
+    _apply(_request('alice', {'H100': 8}))
+    _apply(_request('alice', 'tpu-v5p-8', at_client_side=True))
+    assert usage['lock'].acquisitions == 0
+
+
+@pytest.mark.usefixtures('usage')
+def test_lock_timeout_parks_without_family_marker(quota_file, monkeypatch):
+    quota_file(_LIMITS)
+
+    @contextlib.contextmanager
+    def timeout():
+        raise locks.LockTimeout('busy')
+        yield  # pylint: disable=unreachable
+
+    monkeypatch.setattr(tpu_quota, '_admission_lock', timeout)
+    with pytest.raises(exceptions.ExecutionPausedError) as exc_info:
+        _apply(_request('alice', 'tpu-v5p-8'))
+    assert 'admission lock' in str(exc_info.value)
+    # No family marker, so borrowers do not yield to this request.
+    assert '-share]' not in str(exc_info.value)
+
+
+def test_admitted_but_invisible_request_counts_as_usage(quota_file, usage):
+    """Two requests admitted back to back cannot jointly exceed the pool."""
+    quota_file({'unit': 'chips', 'pool': {'v5p': 8}, 'per_user': {}})
+    # alice's request was admitted a moment ago; her cluster is not in the
+    # cluster table yet.
+    usage['running'] = [
+        _running('req-a', user='alice', demand={'v5p': 8}, cluster='a')
+    ]
+    assert tpu_quota.current_usage('chips') == ({
+        'alice': {
+            'v5p': 8
+        }
+    }, {
+        'v5p': 8
+    })
+    with pytest.raises(exceptions.ExecutionPausedError) as exc_info:
+        _apply(_request('bob', 'tpu-v5p-8'))
+    assert 'pool is full (8/8)' in str(exc_info.value)
+
+
+def test_reservation_dropped_once_cluster_is_visible(quota_file, usage):
+    quota_file({'unit': 'chips', 'pool': {'v5p': 8}, 'per_user': {}})
+    usage['running'] = [
+        _running('req-a', user='alice', demand={'v5p': 4}, cluster='a')
+    ]
+    usage['clusters'] = [
+        _cluster('alice', {'tpu-v5p-8': 1},
+                 status=status_lib.ClusterStatus.INIT,
+                 name='a')
+    ]
+    # 4 from the cluster record only, so bob's 4 fit.
+    assert tpu_quota.current_usage('chips')[1] == {'v5p': 4}
+    _apply(_request('bob', 'tpu-v5p-8'))
+
+
+def test_reservation_dropped_once_job_is_visible(usage):
+    usage['running'] = [
+        _running('req-a', user='alice', demand={'v6e': 8}, job='train'),
+        _running('req-b', user='alice', demand={'v6e': 8}, job='eval'),
+    ]
+    usage['jobs'] = [_job('alice', '1x[tpu-v6e-8:1]', name='train')]
+    assert tpu_quota.current_usage('chips')[1] == {'v6e': 16}
+
+
+def test_pending_reservations_skip_self_and_unadmitted(usage, monkeypatch):
+    monkeypatch.setattr(common_utils, 'get_current_request_id',
+                        lambda: 'req-me')
+    usage['running'] = [
+        _running('req-me', user='alice', demand={'v5p': 4}),
+        # Running but still waiting for the admission lock: nothing recorded.
+        _running('req-b', status_msg=''),
+        _running('req-c', status_msg='[tpu-quota admitted] not json'),
+        _running('req-d', user='bob', demand={'v5p': 4}, unit='slices'),
+        _running('req-e', user='carol', demand={'v5p': 4}),
+    ]
+    assert [r['user'] for r in tpu_quota.pending_reservations(set(), set())
+           ] == ['bob', 'carol']
+    # The slices reservation does not mix with a chips quota.
+    assert tpu_quota.current_usage('chips') == ({
+        'carol': {
+            'v5p': 4
+        }
+    }, {
+        'v5p': 4
+    })
+
+
+def test_record_admission_writes_marker(monkeypatch):
+    request = mock.MagicMock()
+    request.status_msg = None
+
+    @contextlib.contextmanager
+    def update_request(request_id):
+        assert request_id == 'req-me'
+        yield request
+
+    monkeypatch.setattr(common_utils, 'is_in_request_context', lambda: True)
+    monkeypatch.setattr(common_utils, 'get_current_request_id',
+                        lambda: 'req-me')
+    monkeypatch.setattr(api_requests, 'update_request', update_request)
+    tpu_quota._record_admission(  # pylint: disable=protected-access
+        'alice', 'chips', {'v5p': 4}, 'c', None)
+    marker = '[tpu-quota admitted] '
+    assert request.status_msg.startswith(marker)
+    assert json.loads(request.status_msg[len(marker):]) == {
+        'user': 'alice',
+        'unit': 'chips',
+        'demand': {
+            'v5p': 4
+        },
+        'cluster': 'c',
+        'job': None,
+    }
+
+
+def test_record_admission_outside_request_context_is_noop(monkeypatch):
+    monkeypatch.setattr(common_utils, 'is_in_request_context', lambda: False)
+    monkeypatch.setattr(api_requests, 'update_request',
+                        mock.MagicMock(side_effect=AssertionError))
+    tpu_quota._record_admission(  # pylint: disable=protected-access
+        'alice', 'chips', {'v5p': 4}, None, None)
