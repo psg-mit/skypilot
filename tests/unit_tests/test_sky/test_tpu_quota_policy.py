@@ -289,6 +289,7 @@ def test_under_share_waiters_parses_markers(usage):
     assert not tpu_quota.under_share_waiters('v6e', 'me')
 
 
+@pytest.mark.usefixtures('usage')
 def test_rejects_request_larger_than_pool(quota_file):
     quota_file(_LIMITS)
     with pytest.raises(ValueError, match='never be admitted'):
