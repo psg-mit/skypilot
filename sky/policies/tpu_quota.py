@@ -25,11 +25,20 @@ Families are the version token of the accelerator name: ``tpu-v5p-8`` is
 A family missing from ``pool`` is not governed. A family in ``pool`` but
 missing from a user's limits and from ``default`` is limited by the pool only.
 
-Usage is counted from the clusters of all users that are UP or INIT and from
-the managed jobs of all users that are not finished, so both ``sky launch``
-and ``sky jobs launch`` must go through the same API server. The accounting
-is by accelerator name, so TPUs of the TPU API and of the Compute Engine API
-count the same way.
+Usage is counted from the clusters of all users that are UP or INIT,
+including the clusters that the jobs and serve controllers launch (managed job
+clusters, pool workers, service replicas), and from the managed jobs of all
+users that are not finished and have no cluster yet. A managed job that runs
+on a pool holds no TPU of its own and is not counted: the pool's workers are.
+The accounting is by accelerator name, so TPUs of the TPU API and of the
+Compute Engine API count the same way.
+
+Gated requests are ``sky launch``, ``sky jobs launch`` and the worker and
+replica launches that the pool and serve controllers send to the API server.
+A pool worker that does not fit is parked like any other launch, so a pool
+scales up only into free quota and releases it when it scales down.
+``sky jobs pool apply`` and ``sky serve up`` are rejected only when a single
+worker could never fit the pool.
 
 The pool is a hard cap. Shares decide who goes first when the pool is full:
 a parked request from a user within their share is admitted before a request
@@ -50,9 +59,9 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sky import admin_policy
-from sky import core
 from sky import exceptions
 from sky import sky_logging
+from sky.backends import backend_utils
 from sky.jobs import state as managed_job_state
 from sky.jobs.server import core as managed_jobs_core
 from sky.server.requests import request_names
@@ -78,6 +87,20 @@ UNIT_SLICES = 'slices'
 _GATED_REQUESTS = (
     request_names.AdminPolicyRequestName.CLUSTER_LAUNCH,
     request_names.AdminPolicyRequestName.JOBS_LAUNCH,
+    request_names.AdminPolicyRequestName.SERVE_LAUNCH_REPLICA,
+)
+# Requests that define a pool or a service. Their workers are gated one by
+# one when the controller launches them, so only a worker that could never
+# fit is rejected here.
+_WORKER_DEFINING_REQUESTS = (
+    request_names.AdminPolicyRequestName.SERVE_UP,
+    request_names.AdminPolicyRequestName.SERVE_UPDATE,
+)
+# Names under which the gated requests are stored in the request database.
+# Worker and replica launches are stored as cluster launches.
+_GATED_REQUEST_DB_NAMES = (
+    request_names.RequestName.CLUSTER_LAUNCH.value,
+    request_names.RequestName.JOBS_LAUNCH.value,
 )
 # TPU families whose accelerator name counts TensorCores, two per chip.
 _CORE_COUNTED_FAMILIES = ('v2', 'v3', 'v4', 'v5p')
@@ -199,9 +222,11 @@ def task_demand(task: Any, unit: str) -> Usage:
     return demand
 
 
-def _cluster_records() -> List[Any]:
-    # Managed job clusters are excluded by default; the jobs queue counts them.
-    return core.status(refresh=common.StatusRefreshMode.NONE, all_users=True)
+def _cluster_records() -> List[Dict[str, Any]]:
+    # Includes the clusters launched by the jobs and serve controllers.
+    return backend_utils.get_clusters(refresh=common.StatusRefreshMode.NONE,
+                                      all_users=True,
+                                      _include_is_managed=True)
 
 
 def _job_records() -> List[Dict[str, Any]]:
@@ -227,8 +252,9 @@ def _cluster_accelerators(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def current_usage(unit: str) -> Tuple[Dict[str, Usage], Usage]:
     """TPU usage per user and in total.
 
-    Counts the clusters and managed jobs of all users, plus the reservations
-    of admitted launch requests whose cluster or job is not visible yet.
+    Counts the clusters of all users, the managed jobs of all users that have
+    no cluster yet, and the reservations of admitted launch requests whose
+    cluster or job is not visible yet.
     """
     by_user: Dict[str, Usage] = {}
     total: Usage = {}
@@ -260,6 +286,12 @@ def current_usage(unit: str) -> Tuple[Dict[str, Usage], Usage]:
                 managed_job_state.ManagedJobStatus) and status.is_terminal():
             continue
         visible_jobs.add(str(record.get('job_name')))
+        if record.get('pool'):
+            # The job runs on a pool worker, which is counted as a cluster.
+            continue
+        if record.get('current_cluster_name') in visible_clusters:
+            # The job's cluster is counted above.
+            continue
         accelerators = record.get('accelerators')
         num_nodes = 1
         if not accelerators:
@@ -292,7 +324,7 @@ def _gated_requests_with_status(
     return api_requests.get_request_tasks(
         api_requests.RequestTaskFilter(
             status=[status],
-            include_request_names=[name.value for name in _GATED_REQUESTS]))
+            include_request_names=list(_GATED_REQUEST_DB_NAMES)))
 
 
 def _parked_requests() -> List[api_requests.Request]:
@@ -394,8 +426,12 @@ class TPUQuotaPolicy(admin_policy.AdminPolicy):
         passthrough = admin_policy.MutatedUserRequest(
             task=user_request.task,
             skypilot_config=user_request.skypilot_config)
-        if (user_request.at_client_side or
-                user_request.request_name not in _GATED_REQUESTS):
+        if user_request.at_client_side:
+            return passthrough
+        gated = user_request.request_name in _GATED_REQUESTS
+        defines_workers = (user_request.request_name
+                           in _WORKER_DEFINING_REQUESTS)
+        if not gated and not defines_workers:
             return passthrough
         quota = load_quota()
         if quota is None:
@@ -405,6 +441,17 @@ class TPUQuotaPolicy(admin_policy.AdminPolicy):
                 user_request.task, quota.unit).items() if family in quota.pool
         }
         if not demand:
+            return passthrough
+        for family, amount in demand.items():
+            pool = quota.pool[family]
+            if amount > pool:
+                noun = 'worker' if defines_workers else 'request'
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'The {noun} needs {amount} {family} {quota.unit}, '
+                        f'more than the pool of {pool}. It can never be '
+                        'admitted.')
+        if defines_workers:
             return passthrough
 
         assert user_request.user is not None, (
@@ -432,12 +479,6 @@ class TPUQuotaPolicy(admin_policy.AdminPolicy):
             pool = quota.pool[family]
             mine = by_user.get(user, {}).get(family, 0)
             used = total.get(family, 0)
-            if amount > pool:
-                with ux_utils.print_exception_no_traceback():
-                    raise ValueError(
-                        f'The request needs {amount} {family} {quota.unit}, '
-                        f'more than the pool of {pool}. It can never be '
-                        'admitted.')
             over_share = mine + amount > limit
             marker = _waiting_marker(family, over_share)
             if used + amount > pool:

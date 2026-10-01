@@ -11,6 +11,7 @@ from sky import admin_policy
 from sky import exceptions
 from sky import models
 from sky import resources as resources_lib
+from sky.backends import backend_utils
 from sky.clouds.gcp import GCP
 from sky.jobs import state as managed_job_state
 from sky.policies import tpu_quota
@@ -58,12 +59,16 @@ def _cluster(user: str,
 def _job(user: str,
          resources: str,
          status=managed_job_state.ManagedJobStatus.PENDING,
-         name: str = 'job') -> dict:
+         name: str = 'job',
+         pool: str = None,
+         cluster_name: str = None) -> dict:
     return {
         'job_name': name,
         'user_name': user,
         'status': status,
-        'resources': resources
+        'resources': resources,
+        'pool': pool,
+        'current_cluster_name': cluster_name,
     }
 
 
@@ -586,3 +591,85 @@ def test_record_admission_outside_request_context_is_noop(monkeypatch):
                         mock.MagicMock(side_effect=AssertionError))
     tpu_quota._record_admission(  # pylint: disable=protected-access
         'alice', 'chips', {'v5p': 4}, None, None)
+
+
+def test_cluster_records_include_controller_launched_clusters(monkeypatch):
+    calls = []
+    monkeypatch.setattr(backend_utils, 'get_clusters',
+                        lambda **kwargs: calls.append(kwargs) or [])
+    records = tpu_quota._cluster_records()  # pylint: disable=protected-access
+    assert not records
+    assert calls[0]['all_users'] is True
+    assert calls[0]['_include_is_managed'] is True
+
+
+def test_job_on_pool_is_not_counted(usage):
+    # The pool's workers hold the TPUs and are counted as clusters.
+    usage['clusters'] = [
+        _cluster('alice', {'tpu-v5p-8': 1}, name='pool-1'),
+        _cluster('alice', {'tpu-v5p-8': 1}, name='pool-2'),
+    ]
+    usage['jobs'] = [
+        _job('alice',
+             '1x[tpu-v5p-8:1]',
+             status=managed_job_state.ManagedJobStatus.RUNNING,
+             pool='pool',
+             cluster_name='pool-1'),
+        _job('alice', '1x[tpu-v5p-8:1]', pool='pool'),
+    ]
+    assert tpu_quota.current_usage('chips')[1] == {'v5p': 8}
+
+
+def test_job_with_visible_cluster_is_counted_once(usage):
+    usage['clusters'] = [
+        _cluster('bob', {'tpu-v6e-8': 1},
+                 status=status_lib.ClusterStatus.INIT,
+                 name='train-7')
+    ]
+    usage['jobs'] = [
+        _job('bob',
+             '1x[tpu-v6e-8:1]',
+             status=managed_job_state.ManagedJobStatus.STARTING,
+             cluster_name='train-7'),
+        # Still waiting in the controller's queue: no cluster yet.
+        _job('bob', '1x[tpu-v6e-8:1]', cluster_name=None),
+    ]
+    assert tpu_quota.current_usage('chips')[1] == {'v6e': 16}
+
+
+def test_pool_worker_launch_is_gated(quota_file, usage):
+    quota_file({'unit': 'chips', 'pool': {'v5p': 8}, 'per_user': {}})
+    usage['clusters'] = [_cluster('alice', {'tpu-v5p-8': 1}, name='pool-1')]
+    replica = request_names.AdminPolicyRequestName.SERVE_LAUNCH_REPLICA
+    _apply(
+        _request('alice',
+                 'tpu-v5p-8',
+                 request_name=replica,
+                 cluster_name='pool-2'))
+    assert usage['admitted'][0]['cluster'] == 'pool-2'
+    usage['clusters'].append(_cluster('alice', {'tpu-v5p-8': 1}, name='pool-2'))
+    with pytest.raises(exceptions.ExecutionPausedError):
+        _apply(
+            _request('alice',
+                     'tpu-v5p-8',
+                     request_name=replica,
+                     cluster_name='pool-3'))
+
+
+@pytest.mark.parametrize('request_name', [
+    request_names.AdminPolicyRequestName.SERVE_UP,
+    request_names.AdminPolicyRequestName.SERVE_UPDATE,
+])
+def test_pool_definition_checks_worker_size_only(quota_file, usage,
+                                                 request_name):
+    quota_file({'unit': 'chips', 'pool': {'v5p': 8}, 'per_user': {}})
+    usage['clusters'] = [
+        _cluster('alice', {'tpu-v5p-8': 1}, num_nodes=2, name='pool-1')
+    ]
+    # The pool is full, but defining a pool takes no quota: its workers are
+    # gated when they launch.
+    _apply(_request('alice', 'tpu-v5p-8', request_name=request_name))
+    assert usage['lock'].acquisitions == 0
+    assert usage['admitted'] == []
+    with pytest.raises(ValueError, match='worker needs 16 v5p chips'):
+        _apply(_request('alice', 'tpu-v5p-32', request_name=request_name))
