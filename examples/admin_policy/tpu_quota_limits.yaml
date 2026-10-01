@@ -1,0 +1,22 @@
+# Limits for sky.policies.tpu_quota.TPUQuotaPolicy. Copy to
+# ~/.sky/tpu_quota.yaml on the API server; edits apply to the next request.
+#
+# Families are the version token of the accelerator name: tpu-v5p-8 is v5p,
+# tpu-v5litepod-4 is v5litepod, tpu-v6e-8 is v6e. Amounts are in `unit`.
+# With unit: chips, tpu-v5p-8 is 4 chips (8 TensorCores), tpu-v6e-4 is 4.
+unit: chips
+
+# Lab-wide limit per family. A family that is not listed is not governed.
+pool:
+  v5p: 48
+  v6e: 32
+  v5litepod: 16
+
+# Each user's share. A user over their share is still admitted while the
+# pool has room. Keys are SkyPilot user names (`sky status -u`).
+per_user:
+  default:
+    v5p: 16
+    v6e: 8
+  alice:
+    v5p: 32
