@@ -56,7 +56,7 @@ import dataclasses
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple
 
 from sky import admin_policy
 from sky import exceptions
@@ -222,6 +222,15 @@ def task_demand(task: Any, unit: str) -> Usage:
     return demand
 
 
+def paused_error(message: str) -> exceptions.ExecutionPausedError:
+    """The error that parks the request and retries it later."""
+    logger.info(message)
+    return exceptions.ExecutionPausedError(
+        message,
+        hint='Cancel the request with `sky api cancel` to stop waiting.',
+        retry_wait_seconds=RETRY_WAIT_SECONDS)
+
+
 def _cluster_records() -> List[Dict[str, Any]]:
     # Includes the clusters launched by the jobs and serve controllers.
     return backend_utils.get_clusters(refresh=common.StatusRefreshMode.NONE,
@@ -230,9 +239,21 @@ def _cluster_records() -> List[Dict[str, Any]]:
 
 
 def _job_records() -> List[Dict[str, Any]]:
-    return managed_jobs_core.queue(refresh=False,
-                                   skip_finished=True,
-                                   all_users=True)
+    """Unfinished managed jobs of all users.
+
+    A jobs controller that does not exist or is stopped has no unfinished
+    jobs. Any other failure parks the request, since admitting it without the
+    jobs' usage could exceed the pool.
+    """
+    try:
+        return managed_jobs_core.queue(refresh=False,
+                                       skip_finished=True,
+                                       all_users=True)
+    except exceptions.ClusterNotUpError:
+        return []
+    except Exception as e:  # pylint: disable=broad-except
+        raise paused_error('Failed to read the managed jobs for the TPU quota: '
+                           f'{common_utils.format_exception(e)}') from e
 
 
 def _cluster_accelerators(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -460,7 +481,7 @@ class TPUQuotaPolicy(admin_policy.AdminPolicy):
             with _admission_lock():
                 cls._admit(user_request, quota, demand)
         except locks.LockTimeout:
-            cls._park('Waiting for the TPU quota admission lock.')
+            cls.park('Waiting for the TPU quota admission lock.')
         return passthrough
 
     @classmethod
@@ -482,16 +503,16 @@ class TPUQuotaPolicy(admin_policy.AdminPolicy):
             over_share = mine + amount > limit
             marker = _waiting_marker(family, over_share)
             if used + amount > pool:
-                cls._park(f'{marker} {user} is at {mine}/{limit} {family} '
-                          f'{quota.unit} and the pool is full ({used}/{pool}). '
-                          f'Waiting for {amount} {quota.unit} to free up.')
+                cls.park(f'{marker} {user} is at {mine}/{limit} {family} '
+                         f'{quota.unit} and the pool is full ({used}/{pool}). '
+                         f'Waiting for {amount} {quota.unit} to free up.')
             if over_share:
                 waiters = under_share_waiters(family, user_request.user.id)
                 if waiters:
-                    cls._park(f'{marker} {user} is at {mine}/{limit} {family} '
-                              f'{quota.unit}; {len(waiters)} request(s) of '
-                              'users within their share wait for the same '
-                              'family. Yielding to them.')
+                    cls.park(f'{marker} {user} is at {mine}/{limit} {family} '
+                             f'{quota.unit}; {len(waiters)} request(s) of '
+                             'users within their share wait for the same '
+                             'family. Yielding to them.')
                 logger.info(f'User {user} borrows {amount} {family} '
                             f'{quota.unit}: {mine} + {amount} > share {limit}, '
                             f'pool {used} + {amount} <= {pool}.')
@@ -502,9 +523,5 @@ class TPUQuotaPolicy(admin_policy.AdminPolicy):
                           user_request.task.name)
 
     @staticmethod
-    def _park(message: str) -> None:
-        logger.info(message)
-        raise exceptions.ExecutionPausedError(
-            message,
-            hint='Cancel the request with `sky api cancel` to stop waiting.',
-            retry_wait_seconds=RETRY_WAIT_SECONDS)
+    def park(message: str) -> NoReturn:
+        raise paused_error(message)

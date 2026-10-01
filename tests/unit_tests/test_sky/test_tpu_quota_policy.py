@@ -14,6 +14,7 @@ from sky import resources as resources_lib
 from sky.backends import backend_utils
 from sky.clouds.gcp import GCP
 from sky.jobs import state as managed_job_state
+from sky.jobs.server import core as managed_jobs_core
 from sky.policies import tpu_quota
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
@@ -673,3 +674,43 @@ def test_pool_definition_checks_worker_size_only(quota_file, usage,
     assert usage['admitted'] == []
     with pytest.raises(ValueError, match='worker needs 16 v5p chips'):
         _apply(_request('alice', 'tpu-v5p-32', request_name=request_name))
+
+
+def test_job_records_without_jobs_controller_is_empty(monkeypatch):
+    monkeypatch.setattr(
+        managed_jobs_core, 'queue',
+        mock.MagicMock(side_effect=exceptions.ClusterNotUpError(
+            'No in-progress managed jobs.')))
+    assert not tpu_quota._job_records()  # pylint: disable=protected-access
+
+
+def test_job_records_failure_parks(monkeypatch):
+    monkeypatch.setattr(managed_jobs_core, 'queue',
+                        mock.MagicMock(side_effect=RuntimeError('ssh failed')))
+    with pytest.raises(exceptions.ExecutionPausedError,
+                       match='Failed to read the managed jobs'):
+        tpu_quota._job_records()  # pylint: disable=protected-access
+
+
+def test_job_records_failure_parks_through_admin_policy_utils(
+        quota_file, monkeypatch):
+    quota_file(_LIMITS)
+    monkeypatch.setattr(tpu_quota, '_cluster_records', lambda: [])
+    monkeypatch.setattr(tpu_quota, '_running_requests', lambda: [])
+    monkeypatch.setattr(tpu_quota, '_parked_requests', lambda: [])
+    monkeypatch.setattr(
+        managed_jobs_core, 'queue',
+        mock.MagicMock(side_effect=exceptions.ClusterNotUpError('none')))
+    config = config_utils.Config.from_dict(
+        {'admin_policy': 'sky.policies.tpu_quota.TPUQuotaPolicy'})
+    monkeypatch.setattr(sky.skypilot_config, '_get_loaded_config',
+                        lambda *a, **k: config)
+    monkeypatch.setattr(admin_policy_utils.common_utils, 'get_current_user',
+                        lambda: models.User(id='h', name='bob'))
+    monkeypatch.setattr(tpu_quota.locks, 'get_lock',
+                        lambda *a, **k: contextlib.nullcontext())
+    task = sky.Task().set_resources(
+        resources_lib.Resources(cloud=GCP(), accelerators='tpu-v5p-8'))
+    # No jobs controller: the launch is admitted, not rejected.
+    admin_policy_utils.apply(
+        task, request_names.AdminPolicyRequestName.CLUSTER_LAUNCH)
