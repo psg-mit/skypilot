@@ -8,6 +8,8 @@ shared across multiple clouds.GCP() objects.
 import copy
 import dataclasses
 import json
+import math
+import re
 import time
 import typing
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -61,6 +63,18 @@ TPU_MACHINE_TYPE_SPECS: Dict[str, Tuple[int, int]] = {
 # Machine series that carry TPUs. Their host price is included in the TPU
 # SKU, and Compute Engine does not live-migrate them.
 TPU_MACHINE_SERIES = ('ct5p', 'ct5lp', 'ct6e')
+# TPU machine types that join into a multi-host slice, with the number of
+# chips on one host and the number of dimensions of a topology (v5p slices
+# are 3D tori). A multi-host slice is a managed instance group whose workload
+# policy carries the slice's accelerator topology, such as 2x2x2.
+# Reference: https://cloud.google.com/compute/docs/tpus/create-tpu-mig-multi-host-slice # pylint: disable=line-too-long
+TPU_SLICE_CHIPS_PER_HOST: Dict[str, int] = {
+    'ct5p-hightpu-4t': 4,
+}
+TPU_SLICE_TOPOLOGY_DIMS: Dict[str, int] = {
+    'ct5p-hightpu-4t': 3,
+}
+_TPU_TOPOLOGY_RE = re.compile(r'^[1-9][0-9]*(x[1-9][0-9]*){1,2}$')
 
 
 def is_tpu_machine_type(instance_type: Optional[str]) -> bool:
@@ -97,6 +111,63 @@ def is_compute_tpu(resources: Optional['resources_lib.Resources']) -> bool:
     if resources.accelerator_args is None:
         return False
     return resources.accelerator_args.get('api', TPU_API_TPU) == TPU_API_COMPUTE
+
+
+def parse_tpu_topology(topology: str) -> List[int]:
+    """'2x2x4' -> [2, 2, 4]. Raises ValueError for a malformed topology."""
+    if _TPU_TOPOLOGY_RE.match(topology) is None:
+        raise ValueError(f'Invalid TPU topology {topology!r}: expected '
+                         'dimensions such as 2x2x2.')
+    return [int(dim) for dim in topology.split('x')]
+
+
+def get_tpu_slice_hosts(machine_type: str, topology: str) -> int:
+    """The number of hosts of a slice of this topology.
+
+    Raises ValueError when the machine type does not form multi-host slices
+    or the topology does not fill whole hosts.
+    """
+    chips_per_host = TPU_SLICE_CHIPS_PER_HOST.get(machine_type)
+    if chips_per_host is None:
+        raise ValueError(
+            f'{machine_type} does not form multi-host slices. '
+            'accelerator_args.topology supports: '
+            f'{", ".join(TPU_MACHINE_TYPE_TO_ACC[m] for m in TPU_SLICE_CHIPS_PER_HOST)}.'  # pylint: disable=line-too-long
+        )
+    dims = parse_tpu_topology(topology)
+    if len(dims) != TPU_SLICE_TOPOLOGY_DIMS[machine_type]:
+        raise ValueError(
+            f'TPU topology {topology} of {machine_type} must have '
+            f'{TPU_SLICE_TOPOLOGY_DIMS[machine_type]} dimensions, such as '
+            '2x2x2.')
+    chips = math.prod(dims)
+    if chips % chips_per_host != 0:
+        raise ValueError(
+            f'TPU topology {topology} has {chips} chips, which does not fill '
+            f'whole {machine_type} hosts of {chips_per_host} chips.')
+    return chips // chips_per_host
+
+
+def get_compute_tpu_slice_topology(
+        resources: Optional['resources_lib.Resources']) -> Optional[str]:
+    """The topology of a multi-host Compute Engine TPU slice, or None.
+
+    None for anything that is not a Compute Engine TPU spanning more than one
+    host, including a single-host topology such as 2x2x1.
+    """
+    if not is_compute_tpu(resources):
+        return None
+    assert resources is not None
+    topology = (resources.accelerator_args or {}).get('topology')
+    if topology is None:
+        return None
+    machine_type = resources.instance_type
+    if machine_type is None:
+        acc, _ = list(resources.accelerators.items())[0]
+        machine_type = get_tpu_machine_type(acc)
+    if machine_type is None or get_tpu_slice_hosts(machine_type, topology) <= 1:
+        return None
+    return topology
 
 
 def is_tpu_vm(resources: Optional['resources_lib.Resources']) -> bool:

@@ -259,6 +259,11 @@ class GCP(clouds.Cloud):
                     'https://cloud.google.com/tpu/docs/managing-tpus-tpu-vm#stopping_your_resources'
                 )
             }
+        if gcp_utils.get_compute_tpu_slice_topology(resources) is not None:
+            unsupported[clouds.CloudImplementationFeatures.STOP] = (
+                'Multi-host TPU slices of the Compute Engine API cannot be '
+                'stopped: the slice is a managed instance group created in '
+                'bulk')
         if gcp_utils.is_tpu_node(resources):
             # TPU node does not support multi-node.
             unsupported[clouds.CloudImplementationFeatures.MULTI_NODE] = (
@@ -696,6 +701,24 @@ class GCP(clouds.Cloud):
             default_value=None,
             override_configs=resources.cluster_config_overrides)
         use_mig = managed_instance_group_config is not None
+        tpu_slice_topology = gcp_utils.get_compute_tpu_slice_topology(r)
+        if tpu_slice_topology is not None:
+            assert r.instance_type is not None, r
+            hosts = gcp_utils.get_tpu_slice_hosts(r.instance_type,
+                                                  tpu_slice_topology)
+            if num_nodes != hosts:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'TPU topology {tpu_slice_topology} spans {hosts} '
+                        f'{r.instance_type} hosts, so the task needs '
+                        f'num_nodes: {hosts}; got num_nodes: {num_nodes}.')
+            if use_mig:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'gcp.managed_instance_group (DWS) cannot be combined '
+                        'with a multi-host TPU slice, which is a managed '
+                        'instance group of its own.')
+        resources_vars['tpu_slice_topology'] = tpu_slice_topology
         resources_vars['gcp_use_managed_instance_group'] = use_mig
         # Convert boolean to 0 or 1 in string, as GCP does not support boolean
         # value in labels for TPU VM APIs.

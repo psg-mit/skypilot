@@ -69,7 +69,10 @@ provider:
   # The upper-level SkyPilot code has make sure there will not be resource
   # leakage.
   disable_launch_config_check: true
-  use_managed_instance_group: {{ gcp_use_managed_instance_group }}
+  use_managed_instance_group: {{ gcp_use_managed_instance_group or tpu_slice_topology is not none }}
+{%- if tpu_slice_topology is not none %}
+  tpu_slice_topology: {{ tpu_slice_topology }}
+{%- endif %}
 {%- if enable_gvnic %}
   enable_gvnic: {{ enable_gvnic }}
 {%- endif %}
@@ -106,6 +109,10 @@ available_node_types:
         {%- if provision_timeout is defined and provision_timeout is not none %}
         provision_timeout: {{ provision_timeout }}
         {%- endif %}
+      {%- endif %}
+      {%- if tpu_slice_topology is not none %}
+      tpu-slice:
+        topology: {{ tpu_slice_topology }}
       {%- endif %}
       {%- if specific_reservations %}
       reservationAffinity:

@@ -1,0 +1,49 @@
+# A multi-host TPU v5p slice provisioned through the Compute Engine API.
+#
+# Each host is a ct5p-hightpu-4t with 4 chips (tpu-v5p-8). The topology sets
+# the shape of the slice, and num_nodes must equal its number of hosts:
+#   2x2x2 = 8 chips  = 2 hosts (the chips of a tpu-v5p-16)
+#   2x2x4 = 16 chips = 4 hosts (tpu-v5p-32)
+#   2x4x4 = 32 chips = 8 hosts (tpu-v5p-64)
+# Compute Engine creates the hosts as one managed instance group, all at once
+# or not at all. The slice cannot be stopped; use `sky down`.
+#
+# Usage:
+#   sky launch -c tpu-slice examples/tpu/compute_tpu_slice_jax.yaml
+name: compute_tpu_slice_jax
+
+num_nodes: 2
+
+resources:
+  infra: gcp/us-east5
+  accelerators: tpu-v5p-8
+  accelerator_args:
+    api: compute
+    topology: 2x2x2
+  use_spot: true
+
+setup: |
+  conda activate jax
+  if [ $? -eq 0 ]; then
+    echo 'conda env exists'
+  else
+    conda create -n jax python=3.10 -y
+    conda activate jax
+    pip install uv
+    uv pip install "jax[tpu]" \
+      -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+  fi
+
+# The run section starts on every host. Each JAX process sees the 4 local
+# chips and, through the slice's interconnect, all 8 chips.
+run: |
+  conda activate jax
+  python3 -c '
+  import jax
+  print("host", jax.process_index(), "of", jax.process_count())
+  print("local devices:", jax.local_device_count(), "global:", jax.device_count())
+  assert jax.process_count() == 2, jax.process_count()
+  assert jax.device_count() == 8, jax.devices()
+  x = jax.numpy.ones(jax.local_device_count())
+  print("psum:", jax.pmap(lambda v: jax.lax.psum(v, "i"), axis_name="i")(x))
+  '

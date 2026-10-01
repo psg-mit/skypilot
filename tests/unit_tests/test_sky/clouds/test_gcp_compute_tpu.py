@@ -15,6 +15,7 @@ import pytest
 from sky import clouds
 from sky import exceptions
 from sky import resources as resources_lib
+from sky import skypilot_config
 from sky.catalog import gcp_catalog
 from sky.clouds import Region
 from sky.clouds import Zone
@@ -388,3 +389,350 @@ def test_image_size_resolves_image_family():
         project='ubuntu-os-accelerator-images',
         family='ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e')
     compute.images.return_value.get.assert_not_called()
+
+
+# Multi-host slices: tpu-v5p-8 per host, with a topology that spans hosts.
+_SLICE_ARGS = {'api': 'compute', 'topology': '2x2x2'}
+
+
+@pytest.mark.parametrize('machine_type, topology, hosts', [
+    ('ct5p-hightpu-4t', '2x2x1', 1),
+    ('ct5p-hightpu-4t', '2x2x2', 2),
+    ('ct5p-hightpu-4t', '2x4x4', 8),
+])
+def test_tpu_slice_hosts(machine_type, topology, hosts):
+    assert gcp_utils.get_tpu_slice_hosts(machine_type, topology) == hosts
+
+
+@pytest.mark.parametrize('machine_type, topology, message', [
+    ('ct5p-hightpu-4t', '2x2', 'must have 3 dimensions'),
+    ('ct5p-hightpu-4t', '2x3x1', 'does not fill whole'),
+    ('ct5p-hightpu-4t', '2x0x2', 'Invalid TPU topology'),
+    ('ct5p-hightpu-4t', '2-2-2', 'Invalid TPU topology'),
+    ('ct6e-standard-4t', '2x4', 'does not form multi-host slices'),
+])
+def test_tpu_slice_hosts_rejects(machine_type, topology, message):
+    with pytest.raises(ValueError, match=message):
+        gcp_utils.get_tpu_slice_hosts(machine_type, topology)
+
+
+def test_resources_slice_topology():
+    multi_host = resources_lib.Resources(cloud=GCP(),
+                                         accelerators='tpu-v5p-8',
+                                         accelerator_args=dict(_SLICE_ARGS))
+    assert gcp_utils.get_compute_tpu_slice_topology(multi_host) == '2x2x2'
+    single_host = resources_lib.Resources(cloud=GCP(),
+                                          accelerators='tpu-v5p-8',
+                                          accelerator_args={
+                                              'api': 'compute',
+                                              'topology': '2x2x1'
+                                          })
+    assert gcp_utils.get_compute_tpu_slice_topology(single_host) is None
+    unsupported = GCP._unsupported_features_for_resources(multi_host)
+    assert clouds.CloudImplementationFeatures.STOP in unsupported
+    assert (clouds.CloudImplementationFeatures.STOP
+            not in GCP._unsupported_features_for_resources(single_host))
+
+
+@pytest.mark.parametrize('kwargs, message', [
+    (dict(accelerators='tpu-v5p-8',
+          accelerator_args={
+              'api': 'compute',
+              'topology': '2x3x1'
+          }), 'does not fill whole'),
+    (dict(accelerators='tpu-v6e-4',
+          accelerator_args={
+              'api': 'compute',
+              'topology': '2x2'
+          }), 'does not form multi-host slices'),
+    (dict(accelerators='tpu-v5p-8', accelerator_args={'topology': '2x2x2'
+                                                     }), 'requires'),
+    (dict(accelerators='tpu-v5p-16', accelerator_args={'api': 'compute'
+                                                      }), 'topology: 2x2x2'),
+])
+def test_resources_rejects_invalid_slice_args(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        resources_lib.Resources(cloud=GCP(), **kwargs)
+
+
+def test_schema_accepts_topology_key():
+    jsonschema.validate(
+        {
+            'accelerators': 'tpu-v5p-8',
+            'accelerator_args': dict(_SLICE_ARGS)
+        }, schemas.get_resources_schema())
+
+
+def _slice_launchable(**kwargs):
+    return resources_lib.Resources(cloud=GCP(),
+                                   instance_type='ct5p-hightpu-4t',
+                                   accelerators='tpu-v5p-8',
+                                   accelerator_args=dict(_SLICE_ARGS),
+                                   **kwargs)
+
+
+def _slice_deploy_variables(launchable, num_nodes):
+    with mock.patch.object(GCP, 'get_project_id', return_value='project'):
+        return GCP().make_deploy_resources_variables(
+            launchable,
+            resources_utils.ClusterName('tpu', 'tpu-abcd'),
+            Region('us-east5'), [Zone('us-east5-b')],
+            num_nodes=num_nodes,
+            dryrun=True)
+
+
+def _render_slice_config(variables):
+    with open('sky/templates/gcp-ray.yml.j2', encoding='utf-8') as f:
+        template = f.read()
+    provider_start = template.index('  use_managed_instance_group:')
+    provider_end = template.index('{%- if enable_gvnic %}')
+    node_start = template.index('      {%- if tpu_slice_topology is not none')
+    node_end = template.index('      {%- if specific_reservations %}')
+    snippet = (template[provider_start:provider_end] +
+               template[node_start:node_end])
+    return jinja2.Template(snippet).render(**variables)
+
+
+def test_deploy_variables_and_template_for_slice():
+    variables = _slice_deploy_variables(_slice_launchable(use_spot=True), 2)
+    assert variables['tpu_slice_topology'] == '2x2x2'
+    rendered = _render_slice_config(variables)
+    assert 'use_managed_instance_group: True' in rendered
+    assert 'tpu_slice_topology: 2x2x2' in rendered
+    assert 'tpu-slice:\n        topology: 2x2x2' in rendered
+
+    single = _slice_deploy_variables(
+        resources_lib.Resources(cloud=GCP(),
+                                instance_type='ct5p-hightpu-4t',
+                                accelerators='tpu-v5p-8',
+                                accelerator_args={'api': 'compute'}), 1)
+    assert single['tpu_slice_topology'] is None
+    rendered = _render_slice_config(single)
+    assert 'use_managed_instance_group: False' in rendered
+    assert 'tpu-slice' not in rendered
+
+
+def test_deploy_variables_reject_wrong_num_nodes():
+    with pytest.raises(ValueError,
+                       match='needs num_nodes: 2; got num_nodes: 4'):
+        _slice_deploy_variables(_slice_launchable(), 4)
+
+
+def test_deploy_variables_reject_dws_with_slice():
+    real = skypilot_config.get_effective_region_config
+
+    def config(cloud, region, keys, default_value=None, **kwargs):
+        if keys == ('managed_instance_group',):
+            return {'run_duration': 3600}
+        return real(cloud=cloud,
+                    region=region,
+                    keys=keys,
+                    default_value=default_value,
+                    **kwargs)
+
+    with mock.patch.object(skypilot_config,
+                           'get_effective_region_config',
+                           side_effect=config):
+        with pytest.raises(ValueError, match='cannot be combined'):
+            _slice_deploy_variables(_slice_launchable(), 2)
+
+
+def test_node_type_of_slice():
+    assert instance_utils.get_node_type({
+        'machineType': 'ct5p-hightpu-4t',
+        'tpu-slice': {
+            'topology': '2x2x2'
+        },
+    }) == instance_utils.GCPNodeType.TPU_SLICE
+    assert instance_utils.get_node_type({'machineType': 'ct5p-hightpu-4t'
+                                        }) == instance_utils.GCPNodeType.COMPUTE
+
+
+@pytest.fixture
+def slice_apis(monkeypatch):
+    """Records the Compute Engine calls of the slice handler."""
+    calls = []
+    mig = instance_utils.mig_utils
+    handler = instance_utils.GCPTPUSliceInstanceGroup
+
+    def record(name, result=None):
+
+        def fn(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return result
+
+        return fn
+
+    state = {'group_exists': False, 'hosts': ['h1', 'h2']}
+    monkeypatch.setattr(mig, 'check_managed_instance_group_exists',
+                        lambda *a: state['group_exists'])
+    monkeypatch.setattr(mig, 'create_region_instance_template',
+                        record('template', {'name': 'op-t'}))
+    monkeypatch.setattr(mig, 'create_workload_policy',
+                        record('policy', {'name': 'op-p'}))
+    monkeypatch.setattr(mig, 'delete_workload_policy', record('delete_policy'))
+    monkeypatch.setattr(mig, 'create_managed_instance_group',
+                        record('group', {'name': 'op-g'}))
+    monkeypatch.setattr(mig, 'wait_for_managed_group_to_be_stable',
+                        record('wait'))
+    monkeypatch.setattr(handler, 'wait_for_operation', record('op'))
+    monkeypatch.setattr(handler, '_delete_instance_template',
+                        record('delete_template'))
+    monkeypatch.setattr(handler, 'delete_mig', record('delete_mig'))
+    monkeypatch.setattr(handler, '_add_labels_and_find_head',
+                        lambda *a: list(state['hosts']))
+    monkeypatch.setattr(handler, 'create_node_tag', record('head'))
+    return calls, state
+
+
+def _create_slice(count=2, total_count=2):
+    return instance_utils.GCPTPUSliceInstanceGroup.create_instances(
+        'tpu-abcd',
+        'project',
+        'us-east5-b', {
+            'machineType': 'zones/us-east5-b/machineTypes/ct5p-hightpu-4t',
+            'labels': {
+                'skypilot-user': 'Alice'
+            },
+            'tpu-slice': {
+                'topology': '2x2x2'
+            },
+            'networkInterfaces': [{
+                'subnetwork': 'subnet'
+            }],
+            'networkConfig': {
+                'subnetwork': 'subnet'
+            },
+        }, {},
+        count=count,
+        total_count=total_count,
+        include_head_node=True)
+
+
+def test_create_slice(slice_apis):
+    calls, _ = slice_apis
+    assert _create_slice() == (None, ['h1', 'h2'])
+    by_name = {name: (args, kwargs) for name, args, kwargs in calls}
+    args, kwargs = by_name['template']
+    assert kwargs == {'for_tpu_slice': True}
+    template_config = args[4]
+    assert 'tpu-slice' not in template_config
+    assert 'networkConfig' not in template_config
+    assert template_config['networkInterfaces'] == [{'subnetwork': 'subnet'}]
+    assert template_config['machineType'] == 'ct5p-hightpu-4t'
+    assert template_config['labels']['skypilot-user'] == 'alice'
+    assert by_name['policy'][0] == ('project', 'us-east5', 'sky-wp-tpu-abcd',
+                                    '2x2x2')
+    args, kwargs = by_name['group']
+    assert args[:3] == ('project', 'us-east5-b', 'sky-mig-tpu-abcd')
+    assert kwargs['size'] == 2
+    assert kwargs['workload_policy_url'] == (
+        'projects/project/regions/us-east5/resourcePolicies/sky-wp-tpu-abcd')
+    assert by_name['head'][0][2] == 'h1'
+    assert 'delete_mig' not in by_name
+    order = [
+        name for name, _, _ in calls
+        if name in ('template', 'policy', 'group', 'wait')
+    ]
+    assert order == ['template', 'policy', 'group', 'wait']
+
+
+def test_create_slice_replaces_leftover_group(slice_apis):
+    calls, state = slice_apis
+    state['group_exists'] = True
+    _create_slice()
+    names = [name for name, _, _ in calls]
+    assert names.index('delete_mig') < names.index('group')
+
+
+@pytest.mark.usefixtures('slice_apis')
+def test_create_slice_rejects_partial_slice():
+    with pytest.raises(RuntimeError, match='1 of 2 hosts left'):
+        _create_slice(count=1)
+
+
+def test_create_slice_checks_host_count(slice_apis):
+    _, state = slice_apis
+    state['hosts'] = ['h1']
+    with pytest.raises(RuntimeError, match='expected 2'):
+        _create_slice()
+
+
+def test_bulk_group_body(monkeypatch):
+    compute = mock.MagicMock()
+    monkeypatch.setattr(instance_utils.mig_utils.gcp, 'build',
+                        lambda *a, **k: compute)
+    instance_utils.mig_utils.create_managed_instance_group(
+        'project',
+        'us-east5-b',
+        'sky-mig-x',
+        'template-url',
+        size=2,
+        workload_policy_url='policy-url')
+    body = compute.instanceGroupManagers().insert.call_args.kwargs['body']
+    assert body['targetSizePolicy'] == {'mode': 'BULK'}
+    assert body['resourcePolicies'] == {'workloadPolicy': 'policy-url'}
+    assert body['target_size'] == 2
+
+    instance_utils.mig_utils.create_managed_instance_group('project',
+                                                           'us-east5-b',
+                                                           'sky-mig-x',
+                                                           'template-url',
+                                                           size=0)
+    body = compute.instanceGroupManagers().insert.call_args.kwargs['body']
+    assert 'targetSizePolicy' not in body
+    assert 'resourcePolicies' not in body
+
+
+def test_workload_policy_body(monkeypatch):
+    compute = mock.MagicMock()
+    monkeypatch.setattr(instance_utils.mig_utils.gcp, 'build',
+                        lambda *a, **k: compute)
+    instance_utils.mig_utils.create_workload_policy('project', 'us-east5',
+                                                    'sky-wp-x', '2x2x4')
+    kwargs = compute.resourcePolicies().insert.call_args.kwargs
+    assert kwargs['region'] == 'us-east5'
+    assert kwargs['body']['workloadPolicy'] == {
+        'type': 'HIGH_THROUGHPUT',
+        'acceleratorTopology': '2x2x4',
+    }
+
+
+def test_delete_workload_policy_ignores_missing(monkeypatch):
+    error = type('HttpError', (Exception,), {})
+    missing = error('not found')
+    missing.resp = mock.MagicMock(status=404)
+    compute = mock.MagicMock()
+    compute.resourcePolicies().delete().execute.side_effect = missing
+    monkeypatch.setattr(instance_utils.mig_utils.gcp, 'build',
+                        lambda *a, **k: compute)
+    monkeypatch.setattr(instance_utils.mig_utils.gcp, 'http_error_exception',
+                        lambda: error)
+    assert instance_utils.mig_utils.delete_workload_policy(
+        'project', 'us-east5', 'sky-wp-x') is None
+
+
+def test_stop_slice_is_refused():
+    # pylint: disable=import-outside-toplevel
+    from sky.provision.gcp import instance as gcp_instance
+    with pytest.raises(NotImplementedError, match='sky down'):
+        gcp_instance.stop_instances(
+            'tpu-abcd', {
+                'availability_zone': 'us-east5-b',
+                'project_id': 'project',
+                'tpu_slice_topology': '2x2x2',
+            })
+
+
+def test_feasible_resources_keep_slice_topology(small_catalog):
+    df = gcp_catalog.add_tpu_machine_type_rows(small_catalog)
+    with mock.patch.object(gcp_catalog, '_df', df):
+        requested = resources_lib.Resources(cloud=GCP(),
+                                            accelerators='tpu-v5p-8',
+                                            accelerator_args=dict(_SLICE_ARGS),
+                                            use_spot=True)
+        launchable = GCP()._get_feasible_launchable_resources(
+            requested).resources_list[0]
+    assert launchable.instance_type == 'ct5p-hightpu-4t'
+    assert launchable.accelerator_args == _SLICE_ARGS
+    assert gcp_utils.get_compute_tpu_slice_topology(launchable) == '2x2x2'

@@ -934,17 +934,32 @@ class Resources:
                         'compute.')
         machine_type = gcp_utils.get_tpu_machine_type(acc)
         if machine_type is None:
+            hint = ''
+            if acc.startswith('tpu-v5p-'):
+                hint = (' For a multi-host v5p slice, request tpu-v5p-8 per '
+                        'host with accelerator_args.topology and num_nodes, '
+                        'for example topology: 2x2x2 with num_nodes: 2 for '
+                        'the 8 chips of a tpu-v5p-16.')
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
                     f'{acc} has no single-host Compute Engine machine type. '
                     'accelerator_args.api: compute supports: '
-                    f'{", ".join(gcp_utils.TPU_MACHINE_TYPES)}.')
+                    f'{", ".join(gcp_utils.TPU_MACHINE_TYPES)}.{hint}')
         if (self.instance_type is not None and
                 self.instance_type != machine_type):
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(f'The Compute Engine machine type of {acc} is '
                                  f'{machine_type}, got instance_type '
                                  f'{self.instance_type!r}.')
+        topology = accelerator_args.get('topology')
+        if topology is not None:
+            try:
+                gcp_utils.get_tpu_slice_hosts(machine_type, topology)
+            except ValueError as e:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'Invalid accelerator_args.topology for {acc}: {e}'
+                    ) from None
 
     def _set_accelerators(
         self,
@@ -1013,6 +1028,14 @@ class Resources:
 
                 tpu_api = accelerator_args.get('api', gcp_utils.TPU_API_TPU)
                 use_tpu_vm = accelerator_args.get('tpu_vm', True)
+                if ('topology' in accelerator_args and
+                        tpu_api != gcp_utils.TPU_API_COMPUTE):
+                    with ux_utils.print_exception_no_traceback():
+                        raise ValueError(
+                            'accelerator_args.topology requires '
+                            'accelerator_args.api: compute. The TPU API '
+                            'takes the slice size from the accelerator name, '
+                            'such as tpu-v5p-16.')
                 if tpu_api == gcp_utils.TPU_API_COMPUTE:
                     self._validate_compute_tpu_args(acc, accelerator_args)
                 elif (self.cloud.is_same_cloud(clouds.GCP()) and

@@ -878,10 +878,9 @@ class GCPComputeInstance(GCPInstance):
         # https://cloud.google.com/compute/docs/reference/rest/v1/instances/bulkInsert # pylint: disable=line-too-long
         if config.get('sourceMachineImage') is not None:
             return False
-        # TPU machine types are created one instance at a time with insert(),
-        # the path validated for single-host slices. Multi-host slices need
-        # bulkInsert together with a workload policy, which is not supported
-        # yet.
+        # TPU machine types are created one instance at a time with insert().
+        # A multi-host slice is a managed instance group of its own, see
+        # GCPTPUSliceInstanceGroup.
         if gcp_utils.is_tpu_machine_type(config.get('machineType')):
             return False
         # bulkInsert does not support attaching existing
@@ -1229,6 +1228,16 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
         cls._delete_instance_template(
             project_id, zone,
             mig_utils.get_instance_template_name(cluster_name))
+        # A multi-host TPU slice also has a workload policy, which can only be
+        # deleted once no group uses it. DWS groups have none, so this is a
+        # no-op for them. The autostop case above leaves the policy behind
+        # in the same way; the next launch of the same cluster replaces it.
+        region = zone.rpartition('-')[0]
+        operation = mig_utils.delete_workload_policy(
+            project_id, region,
+            mig_utils.get_workload_policy_name(cluster_name))
+        if operation is not None:
+            cls.wait_for_operation(operation, project_id, region=region)
         return mig_exists_and_deleted
 
     @classmethod
@@ -1260,6 +1269,121 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
         pending_running_instance_names.remove(head_instance_name)
         # Label for head node type will be set by caller
         return [head_instance_name] + pending_running_instance_names
+
+
+class GCPTPUSliceInstanceGroup(GCPManagedInstanceGroup):
+    """Handler for a multi-host TPU slice of the Compute Engine API.
+
+    The slice is a managed instance group in BULK mode whose workload policy
+    carries the accelerator topology: Compute Engine creates all hosts at
+    once, interconnected over ICI, or none of them. Each host is one node of
+    the SkyPilot cluster.
+    Reference: https://cloud.google.com/compute/docs/tpus/create-tpu-mig-multi-host-slice # pylint: disable=line-too-long
+    """
+
+    @classmethod
+    def create_instances(
+        cls,
+        cluster_name: str,
+        project_id: str,
+        zone: str,
+        node_config: dict,
+        labels: dict,
+        count: int,
+        total_count: int,
+        include_head_node: bool,
+    ) -> Tuple[Optional[List], List[str]]:
+        del include_head_node  # The head is picked once the slice is up.
+        config = copy.deepcopy(node_config)
+        slice_config = config.pop(constants.TPU_SLICE_CONFIG)
+        # The bootstrap adds the TPU API's network key to every node config;
+        # instances take networkInterfaces instead.
+        config.pop('networkConfig', None)
+        topology = slice_config['topology']
+        region = zone.rpartition('-')[0]
+        template_name = mig_utils.get_instance_template_name(cluster_name)
+        group_name = mig_utils.get_managed_instance_group_name(cluster_name)
+        policy_name = mig_utils.get_workload_policy_name(cluster_name)
+        logger.debug(f'Creating TPU slice {group_name!r} with topology '
+                     f'{topology} and {total_count} hosts.')
+
+        if count != total_count:
+            # A slice in BULK mode cannot grow by a few hosts: some hosts of
+            # the slice are gone, most likely preempted.
+            raise RuntimeError(
+                f'The TPU slice of cluster {cluster_name!r} has '
+                f'{total_count - count} of {total_count} hosts left. A slice '
+                'cannot be repaired in place. Run `sky down` on the cluster '
+                'and launch it again.')
+
+        labels = dict(config.get('labels', {}), **labels)
+        config['labels'] = {
+            k: str(v).lower() for k, v in dict(
+                labels,
+                **{
+                    provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name,
+                    # All hosts start as workers; the head is tagged below.
+                    **provision_constants.WORKER_NODE_TAGS,
+                    provision_constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_name,
+                }).items()
+        }
+        cls._convert_selflinks_in_config(config)
+
+        if mig_utils.check_managed_instance_group_exists(
+                project_id, zone, group_name):
+            # A group without enough running hosts is a leftover, for
+            # example of a launch that timed out waiting for capacity.
+            logger.debug(f'Deleting leftover TPU slice group {group_name!r}.')
+            cls.delete_mig(project_id, zone, cluster_name)
+        # A template or policy without a group is a leftover of an autodown,
+        # which cannot delete them from the host it runs on.
+        cls._delete_instance_template(project_id, zone, template_name)
+        operation = mig_utils.delete_workload_policy(project_id, region,
+                                                     policy_name)
+        if operation is not None:
+            cls.wait_for_operation(operation, project_id, region=region)
+
+        operation = mig_utils.create_region_instance_template(
+            cluster_name,
+            project_id,
+            region,
+            template_name,
+            config,
+            for_tpu_slice=True)
+        cls.wait_for_operation(operation, project_id, region=region)
+        operation = mig_utils.create_workload_policy(project_id, region,
+                                                     policy_name, topology)
+        cls.wait_for_operation(operation, project_id, region=region)
+        operation = mig_utils.create_managed_instance_group(
+            project_id,
+            zone,
+            group_name,
+            f'projects/{project_id}/regions/{region}/instanceTemplates/'
+            f'{template_name}',
+            size=total_count,
+            workload_policy_url=(f'projects/{project_id}/regions/{region}/'
+                                 f'resourcePolicies/{policy_name}'))
+        cls.wait_for_operation(operation, project_id, zone=zone)
+
+        # BULK mode creates no host until it can create all of them. The
+        # timeout bounds the wait for capacity, so that the provisioner can
+        # fail over to the next zone; the failover tears the group down.
+        mig_utils.wait_for_managed_group_to_be_stable(
+            project_id,
+            zone,
+            group_name,
+            timeout=slice_config.get(
+                'provision_timeout',
+                constants.DEFAULT_TPU_SLICE_PROVISION_TIMEOUT))
+
+        instance_names = cls._add_labels_and_find_head(cluster_name, project_id,
+                                                       zone, labels, [])
+        if len(instance_names) != total_count:
+            raise RuntimeError(
+                f'The TPU slice {group_name!r} has {len(instance_names)} '
+                f'hosts after provisioning, expected {total_count}.')
+        cls.create_node_tag(project_id, zone, instance_names[0], is_head=True)
+        return None, instance_names
 
 
 class GCPTPUVMInstance(GCPInstance):
@@ -1892,6 +2016,7 @@ class GCPNodeType(enum.Enum):
     COMPUTE = 'compute'
     MIG = 'mig'
     TPU = 'tpu'
+    TPU_SLICE = 'tpu_slice'
 
 
 def get_node_type(config: Dict[str, Any]) -> GCPNodeType:
@@ -1914,6 +2039,10 @@ def get_node_type(config: Dict[str, Any]) -> GCPNodeType:
 
     if 'machineType' not in config and 'acceleratorType' in config:
         return GCPNodeType.TPU
+
+    if config.get(constants.TPU_SLICE_CONFIG) is not None:
+        # A multi-host TPU slice of the Compute Engine API.
+        return GCPNodeType.TPU_SLICE
 
     if (config.get(constants.MANAGED_INSTANCE_GROUP_CONFIG, None) is not None
             and config.get('guestAccelerators', None) is not None):

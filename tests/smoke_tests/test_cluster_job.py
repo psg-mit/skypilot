@@ -1180,6 +1180,33 @@ def test_tpu_compute_api():
     smoke_tests_utils.run_one_test(test)
 
 
+@pytest.mark.gcp
+@pytest.mark.tpu
+def test_tpu_compute_api_slice():
+    """A 2-host TPU v5p slice provisioned with accelerator_args.api: compute.
+
+    The slice is a managed instance group with a workload policy. JAX on each
+    host must see all 8 chips, which shows the hosts form one slice.
+    """
+    name = smoke_tests_utils.get_cluster_name()
+    test = smoke_tests_utils.Test(
+        'tpu_compute_api_slice',
+        [
+            f'sky launch -y -c {name} examples/tpu/compute_tpu_slice_jax.yaml',
+            f'sky logs {name} 1',  # Ensure the job finished.
+            f'sky logs {name} 1 --status',  # Ensure the job succeeded.
+            f's=$(sky status {name}); echo "$s"; echo "$s" | grep {name} | grep "2x" | grep ct5p-hightpu-4t',  # pylint: disable=line-too-long
+            # Both hosts ran the job and saw the whole slice.
+            f'sky logs {name} 1 | grep "global: 8" | wc -l | grep 2',
+            f'sky exec {name} examples/tpu/compute_tpu_slice_jax.yaml',
+            f'sky logs {name} 2 --status',  # Ensure the job succeeded.
+        ],
+        f'sky down -y {name}',
+        timeout=40 * 60,
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
 # ---------- TPU VM Pod. ----------
 @pytest.mark.skip(reason='We are having trouble getting TPUs in GCP.')
 @pytest.mark.gcp

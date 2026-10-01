@@ -166,6 +166,8 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
         resource = instance_utils.GCPComputeInstance
     elif node_type == instance_utils.GCPNodeType.MIG:
         resource = instance_utils.GCPManagedInstanceGroup
+    elif node_type == instance_utils.GCPNodeType.TPU_SLICE:
+        resource = instance_utils.GCPTPUSliceInstanceGroup
     elif node_type == instance_utils.GCPNodeType.TPU:
         resource = instance_utils.GCPTPUVMInstance
     else:
@@ -466,6 +468,14 @@ def stop_instances(
     label_filters = {
         provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
     }
+
+    if provider_config.get('tpu_slice_topology') is not None:
+        # The feature check of the cloud rejects `sky stop` earlier. The
+        # provisioner's failover handler turns NotImplementedError into
+        # StopFailoverError instead of retrying the stop.
+        raise NotImplementedError(
+            'Multi-host TPU slices of the Compute Engine API cannot be '
+            f'stopped. Run `sky down` on {cluster_name_on_cloud!r} instead.')
 
     tpu_node = provider_config.get('tpu_node')
     if tpu_node is not None:
