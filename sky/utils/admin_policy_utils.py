@@ -186,6 +186,11 @@ def apply(
         except exceptions.UserRequestRejectedByPolicy as e:
             with ux_utils.print_exception_no_traceback():
                 raise e
+        except exceptions.ExecutionRetryableError:
+            # A policy may park the request (ExecutionPausedError) until an
+            # external condition, such as a quota, lets it proceed. The
+            # request executor re-schedules it; a rejection would be final.
+            raise
         except Exception as e:  # pylint: disable=broad-except
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.UserRequestRejectedByPolicy(

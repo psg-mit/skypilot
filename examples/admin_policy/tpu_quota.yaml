@@ -1,0 +1,5 @@
+# API server config: park TPU launches that exceed the user's share while the
+# lab-wide pool is full. Limits are read from ~/.sky/tpu_quota.yaml (or the
+# path in $SKYPILOT_TPU_QUOTA_FILE) on every request; see
+# examples/admin_policy/tpu_quota_limits.yaml for the format.
+admin_policy: sky.policies.tpu_quota.TPUQuotaPolicy
