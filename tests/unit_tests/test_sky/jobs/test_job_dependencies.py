@@ -48,14 +48,16 @@ def _add_job(engine,
              schedule_state: ManagedJobScheduleState,
              *task_statuses: ManagedJobStatus,
              primary: Optional[list] = None,
-             priority: int = 500) -> None:
+             priority: int = 500,
+             pool: Optional[str] = None) -> None:
     with orm.Session(engine) as session:
         session.execute(
             state.sqlalchemy.insert(state.job_info_table).values(
                 spot_job_id=job_id,
                 name=f'job-{job_id}',
                 schedule_state=schedule_state.value,
-                priority=priority))
+                priority=priority,
+                pool=pool))
         for task_id, status in enumerate(task_statuses):
             session.execute(
                 state.sqlalchemy.insert(state.spot_table).values(
@@ -72,6 +74,55 @@ def _claim() -> Optional[int]:
     claimed = asyncio.run(state.get_waiting_job_async(pid=1,
                                                       pid_started_at=1.0))
     return None if claimed is None else claimed['job_id']
+
+
+class TestPoolQueueLength:
+
+    def test_a_job_waiting_on_a_dependency_is_not_queued_for_a_worker(
+            self, _db):
+        _add_job(_db,
+                 1,
+                 ManagedJobScheduleState.ALIVE,
+                 ManagedJobStatus.RUNNING,
+                 pool='p')
+        _add_job(_db,
+                 2,
+                 ManagedJobScheduleState.WAITING,
+                 ManagedJobStatus.PENDING,
+                 pool='p')
+        state.set_job_dependencies(2, [1])
+        _add_job(_db,
+                 3,
+                 ManagedJobScheduleState.WAITING,
+                 ManagedJobStatus.PENDING,
+                 pool='p')
+        _add_job(_db,
+                 4,
+                 ManagedJobScheduleState.WAITING,
+                 ManagedJobStatus.PENDING,
+                 pool='other')
+
+        # Job 2 cannot start before job 1 finishes, so only job 3 needs a
+        # worker of pool 'p'.
+        assert state.get_pending_jobs_count_by_pool('p') == 1
+
+        with orm.Session(_db) as session:
+            session.execute(
+                state.sqlalchemy.update(state.job_info_table).where(
+                    state.job_info_table.c.spot_job_id == 1).values(
+                        schedule_state=ManagedJobScheduleState.DONE.value))
+            session.commit()
+        assert state.get_pending_jobs_count_by_pool('p') == 2
+
+    def test_a_missing_dependency_does_not_hold_the_job_out_of_the_queue(
+            self, _db):
+        _add_job(_db,
+                 5,
+                 ManagedJobScheduleState.WAITING,
+                 ManagedJobStatus.PENDING,
+                 pool='p')
+        state.set_job_dependencies(5, [99])
+        assert state.get_pending_jobs_count_by_pool('p') == 1
 
 
 class TestClaim:
