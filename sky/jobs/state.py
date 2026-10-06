@@ -3397,6 +3397,11 @@ def get_pending_jobs_count_by_pool(pool: str) -> int:
 
     Pending jobs are jobs that are waiting for a worker, i.e., jobs with:
     - status = PENDING
+    - every job they depend on DONE
+
+    A job whose dependencies are unfinished is also PENDING, but no worker can
+    run it yet, so counting it would scale the pool up for work that cannot
+    start.
 
     Args:
         pool: The pool name
@@ -3416,6 +3421,7 @@ def get_pending_jobs_count_by_pool(pool: str) -> int:
                     sqlalchemy.and_(
                         spot_table.c.status == ManagedJobStatus.PENDING.value,
                         job_info_table.c.pool == pool,
+                        ~_unfinished_dependency_exists(),
                     ))
         result = session.execute(query).fetchone()
         return result[0] if result else 0
