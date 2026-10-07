@@ -107,7 +107,7 @@ def query_instances(
     # GCP does not clean up preempted TPU VMs. We remove it ourselves.
     if handler == instance_utils.GCPTPUVMInstance:
         all_preempted = all(s == 'PREEMPTED' for s in raw_statuses.values())
-        if all_preempted:
+        if raw_statuses and all_preempted:
             logger.info(
                 f'Terminating preempted TPU VM cluster {cluster_name_on_cloud}')
             terminate_instances(cluster_name_on_cloud, provider_config)
@@ -548,6 +548,12 @@ def terminate_instances(
     }
     if worker_only:
         label_filters[provision_constants.TAG_RAY_NODE_KIND] = 'worker'
+
+    if use_tpu_vms:
+        # Requests can outlive their nodes or still be waiting for capacity.
+        # Remove them first; force deletion also removes any backing nodes.
+        instance_utils.GCPTPUVMInstance.terminate_queued_resources(
+            project_id, zone, label_filters)
 
     handlers: List[Type[instance_utils.GCPInstance]] = [
         instance_utils.GCPComputeInstance

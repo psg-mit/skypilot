@@ -1410,6 +1410,79 @@ class GCPTPUVMInstance(GCPInstance):
         return operation
 
     @classmethod
+    def filter_queued_resources(
+            cls, project_id: str, zone: str,
+            label_filters: Dict[str, str]) -> Dict[str, Any]:
+        """Find owned requests even when their TPU nodes are absent."""
+        if not label_filters.get(provision_constants.TAG_RAY_CLUSTER_NAME):
+            raise ValueError(
+                'Queued resource cleanup requires a cluster label.')
+
+        worker_only = label_filters.get(
+            provision_constants.TAG_RAY_NODE_KIND) == 'worker'
+        protected_node_ids = set()
+        if worker_only:
+            # A worker may have been promoted to head since request creation.
+            live_nodes = cls.filter(
+                project_id,
+                zone, {
+                    provision_constants.TAG_RAY_CLUSTER_NAME: label_filters[
+                        provision_constants.TAG_RAY_CLUSTER_NAME]
+                },
+                status_filters=None)
+            protected_node_ids = {
+                name.rsplit('/', 1)[-1]
+                for name, node in live_nodes.items()
+                if node.get('labels', {}).get(
+                    provision_constants.TAG_RAY_NODE_KIND) != 'worker'
+            }
+
+        resources = cls.load_resource().projects().locations().queuedResources()
+        request = resources.list(
+            parent=f'projects/{project_id}/locations/{zone}')
+        matched = {}
+        while request is not None:
+            response = request.execute(num_retries=GCP_MAX_RETRIES)
+            if response.get('unreachable'):
+                raise common.ProvisionerError(
+                    f'Queued resource inventory is unreachable: '
+                    f'{response["unreachable"]}')
+            for resource in response.get('queuedResources', []):
+                node_specs = resource.get('tpu', {}).get('nodeSpec', [])
+                # Deleting a request removes all its nodes, so every node
+                # specification must match, including worker-only filtering.
+                if node_specs and all(
+                        all(
+                            spec.get('node', {}).get('labels', {}).get(key) ==
+                            value
+                            for key, value in label_filters.items()) and
+                        spec.get('nodeId') not in protected_node_ids and
+                        not (worker_only and spec.get('multiNodeParams'))
+                        for spec in node_specs):
+                    matched[resource['name']] = resource
+            request = resources.list_next(request, response)
+        return matched
+
+    @classmethod
+    def terminate_queued_resources(cls, project_id: str, zone: str,
+                                   label_filters: Dict[str, str]) -> None:
+        """Delete owned requests and their nodes, waiting for completion."""
+        requests = cls.filter_queued_resources(project_id, zone, label_filters)
+        resources = cls.load_resource().projects().locations().queuedResources()
+        for name in requests:
+            try:
+                # Deleting only the node leaves a SUSPENDED request consuming
+                # queue quota. force also handles requests with running nodes.
+                operation = resources.delete(
+                    name=name, force=True).execute(num_retries=GCP_MAX_RETRIES)
+            except gcp.http_error_exception() as e:
+                if e.resp.status != 404:
+                    raise
+                logger.debug(f'Queued resource {name} was already deleted.')
+                continue
+            cls.wait_for_operation(operation, project_id, zone=zone)
+
+    @classmethod
     def add_network_tag_if_not_exist(
         cls,
         project_id: str,
