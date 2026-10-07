@@ -5,6 +5,7 @@ from unittest import mock
 from sky.serve import autoscalers
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.serve import service_spec
 
 
 class TestSelectNonterminalReplicasToScaleDown(unittest.TestCase):
@@ -151,6 +152,59 @@ class TestSelectNonterminalReplicasToScaleDown(unittest.TestCase):
         # Should select old version replica first despite having more jobs
         self.assertEqual(len(result), 1)
         self.assertEqual(result, [1])
+
+
+class TestAutoscalerFromSpecVersion(unittest.TestCase):
+    """Test cases for the version passed to Autoscaler.from_spec."""
+
+    def setUp(self):
+        self.service_name = 'test-pool'
+        self.spec = service_spec.SkyServiceSpec.from_yaml_config({
+            'pool': {
+                'workers': 2
+            },
+        })
+
+    def _ready_replica(self, replica_id: int,
+                       version: int) -> replica_managers.ReplicaInfo:
+        info = mock.Mock(spec=replica_managers.ReplicaInfo)
+        info.replica_id = replica_id
+        info.cluster_name = f'{self.service_name}-{replica_id}'
+        info.version = version
+        info.status = serve_state.ReplicaStatus.READY
+        info.is_ready = True
+        info.is_terminal = False
+        return info
+
+    def test_default_version(self):
+        autoscaler = autoscalers.Autoscaler.from_spec(self.service_name,
+                                                      self.spec)
+        self.assertEqual(autoscaler.latest_version, 1)
+        self.assertEqual(autoscaler.latest_version_ever_ready, 0)
+
+    @mock.patch('sky.serve.autoscalers.managed_job_state.'
+                'get_nonterminal_job_ids_by_pool',
+                return_value=[])
+    @mock.patch('sky.serve.autoscalers.managed_job_state.'
+                'get_pending_jobs_count_by_pool',
+                return_value=0)
+    def test_recovered_version_keeps_up_to_date_replicas(
+            self, mock_pending, mock_job_ids):
+        """A controller recovered at version 3 must not replace the ready
+        version-3 replicas."""
+        del mock_pending, mock_job_ids  # Unused.
+        autoscaler = autoscalers.Autoscaler.from_spec(self.service_name,
+                                                      self.spec,
+                                                      version=3)
+        self.assertEqual(autoscaler.latest_version, 3)
+        self.assertEqual(autoscaler.latest_version_ever_ready, 2)
+
+        replica_infos = [self._ready_replica(1, 3), self._ready_replica(2, 3)]
+        decisions = autoscaler.generate_scaling_decisions(replica_infos,
+                                                          active_versions=[3])
+
+        self.assertEqual(decisions, [])
+        self.assertEqual(autoscaler.latest_version_ever_ready, 3)
 
 
 if __name__ == '__main__':
