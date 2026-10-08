@@ -3393,16 +3393,18 @@ def get_num_alive_jobs(pool: Optional[str] = None) -> int:
 
 
 def get_pending_jobs_count_by_pool(pool: str) -> int:
-    """Get the count of pending jobs in a pool.
+    """Get the count of jobs in a pool that are waiting for a worker.
 
-    Pending jobs are jobs that are waiting for a worker, i.e., jobs with:
-    - status = PENDING
+    A job waits for a worker when its status is PENDING, or when its status is
+    STARTING and the pool has not assigned it a worker yet. The controller
+    sets a pool job to STARTING before it looks for a free worker, and the job
+    stays STARTING until a worker frees up.
 
     Args:
         pool: The pool name
 
     Returns:
-        The number of pending jobs in the pool
+        The number of jobs in the pool that are waiting for a worker
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -3411,12 +3413,19 @@ def get_pending_jobs_count_by_pool(pool: str) -> int:
             sqlalchemy.func.count()  # pylint: disable=not-callable
         ).select_from(
             job_info_table.join(
-                spot_table, job_info_table.c.spot_job_id ==
-                spot_table.c.spot_job_id)).where(
+                spot_table,
+                job_info_table.c.spot_job_id == spot_table.c.spot_job_id)
+        ).where(
+            sqlalchemy.and_(
+                sqlalchemy.or_(
+                    spot_table.c.status == ManagedJobStatus.PENDING.value,
                     sqlalchemy.and_(
-                        spot_table.c.status == ManagedJobStatus.PENDING.value,
-                        job_info_table.c.pool == pool,
-                    ))
+                        spot_table.c.status == ManagedJobStatus.STARTING.value,
+                        job_info_table.c.current_cluster_name.is_(None),
+                    ),
+                ),
+                job_info_table.c.pool == pool,
+            ))
         result = session.execute(query).fetchone()
         return result[0] if result else 0
 

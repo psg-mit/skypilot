@@ -358,10 +358,12 @@ The full set of autoscaling options:
     # Set to 0 (default) to allow scale-to-zero.
     min_workers: 0
 
-    # Number of pending jobs that triggers scaling up or down (default: 1).
-    # - Scale up by 1 worker when pending jobs > queue_length_threshold.
-    # - Scale down by 1 worker when 0 < pending jobs < queue_length_threshold.
-    # - Scale down to min_workers immediately when there are no pending jobs.
+    # Number of jobs waiting for a worker that triggers scaling up or down
+    # (default: 1). A job waits for a worker while it is PENDING, or while it
+    # is STARTING and has no worker yet.
+    # - Scale up by 1 worker when waiting jobs > queue_length_threshold.
+    # - Scale down by 1 worker when 0 < waiting jobs < queue_length_threshold.
+    # - Scale down to min_workers immediately when no job is waiting.
     queue_length_threshold: 1
 
     # How long to wait (seconds) after demand is detected before adding

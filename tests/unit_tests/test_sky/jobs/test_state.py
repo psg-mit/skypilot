@@ -550,3 +550,26 @@ def test_get_nonterminal_job_ids_by_pool_grouped_all_terminal(
                   cluster_name='replica-x')
     _new_pool_job(engine, pool='pool-done', status=ManagedJobStatus.FAILED)
     assert not state.get_nonterminal_job_ids_by_pool_grouped('pool-done')
+
+
+def test_get_pending_jobs_count_by_pool_counts_starting_without_worker(
+        _mock_managed_jobs_db_conn):
+    """A STARTING job without a worker waits for one, like a PENDING job."""
+    engine = state._db_manager.get_engine()
+    _new_pool_job(engine, pool='pool-a', status=ManagedJobStatus.PENDING)
+    _new_pool_job(engine, pool='pool-a', status=ManagedJobStatus.STARTING)
+    _new_pool_job(engine, pool='pool-a', status=ManagedJobStatus.STARTING)
+    # On a worker: not waiting.
+    _new_pool_job(engine,
+                  pool='pool-a',
+                  status=ManagedJobStatus.STARTING,
+                  cluster_name='replica-1')
+    _new_pool_job(engine,
+                  pool='pool-a',
+                  status=ManagedJobStatus.RUNNING,
+                  cluster_name='replica-2')
+    _new_pool_job(engine, pool='pool-b', status=ManagedJobStatus.STARTING)
+
+    assert state.get_pending_jobs_count_by_pool('pool-a') == 3
+    assert state.get_pending_jobs_count_by_pool('pool-b') == 1
+    assert state.get_pending_jobs_count_by_pool('nope') == 0
