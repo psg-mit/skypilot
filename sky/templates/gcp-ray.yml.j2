@@ -223,7 +223,9 @@ available_node_types:
       scheduling:
   {%- if use_spot %}
         automaticRestart: false
-        instanceTerminationAction: DELETE
+        # Compute Engine rejects spot VMs that are deleted on preemption in
+        # a managed instance group, which a multi-host TPU slice uses.
+        instanceTerminationAction: {{ 'STOP' if tpu_slice_topology is not none else 'DELETE' }}
         onHostMaintenance: TERMINATE
         provisioningModel: SPOT
         preemptible: true

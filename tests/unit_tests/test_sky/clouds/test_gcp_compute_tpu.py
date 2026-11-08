@@ -512,6 +512,29 @@ def test_deploy_variables_and_template_for_slice():
     assert 'tpu-slice' not in rendered
 
 
+def _render_scheduling(variables):
+    with open('sky/templates/gcp-ray.yml.j2', encoding='utf-8') as f:
+        template = f.read()
+    start = template.index('  {%- if use_spot or gpu is not none')
+    end = template.index('{%- endif %}\n\nhead_node_type:')
+    return jinja2.Template(template[start:end]).render(**variables)
+
+
+def test_spot_slice_stops_on_preemption():
+    variables = _slice_deploy_variables(_slice_launchable(use_spot=True), 2)
+    rendered = _render_scheduling(variables)
+    assert 'provisioningModel: SPOT' in rendered
+    assert 'instanceTerminationAction: STOP' in rendered
+
+    single = _slice_deploy_variables(
+        resources_lib.Resources(cloud=GCP(),
+                                instance_type='ct5p-hightpu-4t',
+                                accelerators='tpu-v5p-8',
+                                accelerator_args={'api': 'compute'},
+                                use_spot=True), 1)
+    assert 'instanceTerminationAction: DELETE' in _render_scheduling(single)
+
+
 def test_deploy_variables_reject_wrong_num_nodes():
     with pytest.raises(ValueError,
                        match='needs num_nodes: 2; got num_nodes: 4'):
