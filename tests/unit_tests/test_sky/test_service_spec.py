@@ -62,6 +62,37 @@ class TestPoolConfiguration:
         assert spec.max_replicas == 10
         assert spec.queue_length_threshold == 5
 
+    def test_pool_with_zero_queue_length_threshold(self):
+        """Test pool with queue_length_threshold set to 0."""
+        config = {
+            'pool': {
+                'min_workers': 0,
+                'max_workers': 10,
+                'queue_length_threshold': 0,
+            },
+            'readiness_probe': '/',
+        }
+
+        spec = service_spec.SkyServiceSpec.from_yaml_config(config)
+
+        assert spec.min_replicas == 0
+        assert spec.max_replicas == 10
+        assert spec.queue_length_threshold == 0
+
+    def test_pool_with_negative_queue_length_threshold_fails(self):
+        """Test that pool with negative queue_length_threshold fails."""
+        config = {
+            'pool': {
+                'min_workers': 0,
+                'max_workers': 10,
+                'queue_length_threshold': -1,
+            },
+            'readiness_probe': '/',
+        }
+
+        with pytest.raises(ValueError):
+            service_spec.SkyServiceSpec.from_yaml_config(config)
+
     def test_pool_with_min_max_workers_and_delays(self):
         """Test pool with autoscaling and delay settings."""
         config = {

@@ -3395,10 +3395,12 @@ def get_num_alive_jobs(pool: Optional[str] = None) -> int:
 def get_pending_jobs_count_by_pool(pool: str) -> int:
     """Get the count of jobs in a pool that are waiting for a worker.
 
-    A job waits for a worker when its status is PENDING, or when its status is
-    STARTING and the pool has not assigned it a worker yet. The controller
-    sets a pool job to STARTING before it looks for a free worker, and the job
-    stays STARTING until a worker frees up.
+    A job waits for a worker when every job it depends on is DONE and its
+    status is PENDING, or its status is STARTING and the pool has not assigned
+    it a worker yet. The controller sets a pool job to STARTING before it looks
+    for a free worker, and the job stays STARTING until a worker frees up. A
+    job whose dependencies are unfinished cannot run on any worker yet, so
+    counting it would scale the pool up for work that cannot start.
 
     Args:
         pool: The pool name
@@ -3425,6 +3427,7 @@ def get_pending_jobs_count_by_pool(pool: str) -> int:
                     ),
                 ),
                 job_info_table.c.pool == pool,
+                ~_unfinished_dependency_exists(),
             ))
         result = session.execute(query).fetchone()
         return result[0] if result else 0

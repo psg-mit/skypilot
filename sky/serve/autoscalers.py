@@ -230,19 +230,31 @@ class Autoscaler:
                                           target_num_replicas))
 
     @classmethod
-    def from_spec(cls, service_name: str,
-                  spec: 'service_spec.SkyServiceSpec') -> 'Autoscaler':
+    def from_spec(cls,
+                  service_name: str,
+                  spec: 'service_spec.SkyServiceSpec',
+                  version: int = constants.INITIAL_VERSION) -> 'Autoscaler':
+        """Create an autoscaler for the spec at the given service version.
+
+        A controller that restarts on an existing service passes the service's
+        latest version, so the autoscaler treats the replicas of that version
+        as up to date instead of as outdated replicas to replace.
+        """
         # TODO(MaoZiming): use NAME to get the class.
+        autoscaler: Autoscaler
         if spec.pool:
-            return QueueLengthAutoscaler(service_name, spec)
+            autoscaler = QueueLengthAutoscaler(service_name, spec)
         elif spec.use_ondemand_fallback:
-            return FallbackRequestRateAutoscaler(service_name, spec)
+            autoscaler = FallbackRequestRateAutoscaler(service_name, spec)
         elif isinstance(spec.target_qps_per_replica, dict):
             # Use instance-aware autoscaler
             # when target_qps_per_replica is a dict
-            return InstanceAwareRequestRateAutoscaler(service_name, spec)
+            autoscaler = InstanceAwareRequestRateAutoscaler(service_name, spec)
         else:
-            return RequestRateAutoscaler(service_name, spec)
+            autoscaler = RequestRateAutoscaler(service_name, spec)
+        autoscaler.latest_version = version
+        autoscaler.latest_version_ever_ready = version - 1
+        return autoscaler
 
     def get_decision_interval(self) -> int:
         """Get the decision interval for the autoscaler.

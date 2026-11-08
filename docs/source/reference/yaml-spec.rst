@@ -1734,6 +1734,8 @@ Number of pending jobs that triggers upscaling (default: 1).
 
 When the number of pending jobs exceeds this threshold, the pool scales up. Requires ``max_workers`` to be set.
 
+Set to ``0`` to scale up whenever any job is pending.
+
 .. code-block:: yaml
 
   pool:

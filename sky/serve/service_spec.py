@@ -80,9 +80,9 @@ class SkyServiceSpec:
 
             # Validate queue_length_threshold if provided
             if queue_length_threshold is not None:
-                if queue_length_threshold <= 0:
+                if queue_length_threshold < 0:
                     with ux_utils.print_exception_no_traceback():
-                        raise ValueError('queue_length_threshold must be > 0. '
+                        raise ValueError('queue_length_threshold must be >= 0. '
                                          f'Got: {queue_length_threshold}')
                 # If queue_length_threshold is set, max_workers (max_replicas)
                 # must also be set.
