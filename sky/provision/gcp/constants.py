@@ -446,3 +446,9 @@ MANAGED_INSTANCE_GROUP_CONFIG = 'managed-instance-group'
 DEFAULT_MANAGED_INSTANCE_GROUP_PROVISION_TIMEOUT = 900  # 15 minutes
 MIG_NAME_PREFIX = 'sky-mig-'
 INSTANCE_TEMPLATE_NAME_PREFIX = 'sky-it-'
+
+# Multi-host TPU slice constants. A slice is a managed instance group created
+# in bulk with a workload policy that carries the accelerator topology.
+TPU_SLICE_CONFIG = 'tpu-slice'
+WORKLOAD_POLICY_NAME_PREFIX = 'sky-wp-'
+DEFAULT_TPU_SLICE_PROVISION_TIMEOUT = 900  # 15 minutes

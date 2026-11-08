@@ -543,6 +543,12 @@ def _get_single_resources_schema():
                         'type': 'string',
                         'enum': ['tpu', 'compute'],
                     },
+                    # The accelerator topology of a multi-host slice of the
+                    # Compute Engine API, such as 2x2x2. The task's num_nodes
+                    # must equal the number of hosts of the topology.
+                    'topology': {
+                        'type': 'string',
+                    },
                 }
             },
             '_no_missing_accel_warnings': {

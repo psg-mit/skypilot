@@ -22,6 +22,9 @@ the file changes the quota without restarting the API server:
 
 Families are the version token of the accelerator name: ``tpu-v5p-8`` is
 ``v5p``, ``tpu-v5litepod-4`` is ``v5litepod``, ``tpu-v6e-8`` is ``v6e``.
+A multi-host slice of the Compute Engine API is ``tpu-v5p-8`` on each of its
+``num_nodes`` hosts, so with ``unit: slices`` it counts one slice per host;
+with ``unit: chips`` it counts its chips like any other slice.
 A family missing from ``pool`` is not governed. A family in ``pool`` but
 missing from a user's limits and from ``default`` is limited by the pool only.
 

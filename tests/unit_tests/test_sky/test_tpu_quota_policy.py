@@ -244,6 +244,19 @@ def test_load_quota_fails_open(quota_file):
     assert tpu_quota.load_quota() is None  # malformed file
 
 
+def test_task_demand_of_compute_slice():
+    # A 2-host v5p slice of the Compute Engine API: tpu-v5p-8 on each host.
+    task = sky.Task(num_nodes=2).set_resources(
+        resources_lib.Resources(cloud=GCP(),
+                                accelerators='tpu-v5p-8',
+                                accelerator_args={
+                                    'api': 'compute',
+                                    'topology': '2x2x2'
+                                }))
+    assert tpu_quota.task_demand(task, 'chips') == {'v5p': 8}
+    assert tpu_quota.task_demand(task, 'slices') == {'v5p': 2}
+
+
 def test_task_demand_counts_nodes_and_largest_candidate():
     req = _request('bob', 'tpu-v5p-8', num_nodes=2)
     assert tpu_quota.task_demand(req.task, 'chips') == {'v5p': 8}
