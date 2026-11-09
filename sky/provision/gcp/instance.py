@@ -111,6 +111,29 @@ def query_instances(
             logger.info(
                 f'Terminating preempted TPU VM cluster {cluster_name_on_cloud}')
             terminate_instances(cluster_name_on_cloud, provider_config)
+        else:
+            # An accepted request can have no nodes yet, and a suspended or
+            # failed request can outlive its nodes. Returning an empty status
+            # drops the cluster registration, making subsequent down/cancel
+            # skip provider cleanup. Keep every owned request visible until
+            # explicit teardown, without reporting nonexistent guests as UP.
+            requests = instance_utils.GCPTPUVMInstance.filter_queued_resources(
+                project_id, zone, label_filters)
+            for name, request in requests.items():
+                state = request.get('state', {}).get('state')
+                status = status_lib.ClusterStatus.INIT
+                if state in ('FAILED', 'SUSPENDED'):
+                    status = status_lib.ClusterStatus.STOPPED
+                for spec in request['tpu']['nodeSpec']:
+                    node_id = spec.get('nodeId')
+                    node_name = (
+                        f'projects/{project_id}/locations/{zone}/nodes/'
+                        f'{node_id}' if node_id else name)
+                    # The node is authoritative when it exists. A multi-node
+                    # request without explicit node IDs remains INIT rather
+                    # than certifying any unobserved guest as ready.
+                    if node_name not in raw_statuses:
+                        statuses[node_name] = (status, None)
     # TODO(zhwu): TPU node should check the status of the attached TPU as well.
     return statuses
 
@@ -591,6 +614,19 @@ def terminate_instances(
     _wait_for_operations(operations, project_id, zone)
     if errs:
         raise RuntimeError(f'Failed to terminate instances: {errs}')
+    if use_tpu_vms:
+        # Do not discard the native handle on operation success alone. It is
+        # the only route ordinary down/cancel has to these cloud resources.
+        remaining_requests = (
+            instance_utils.GCPTPUVMInstance.filter_queued_resources(
+                project_id, zone, label_filters))
+        remaining_nodes = instance_utils.GCPTPUVMInstance.filter(
+            project_id, zone, label_filters, status_filters=None)
+        if remaining_requests or remaining_nodes:
+            raise common.ProvisionerError(
+                'Cloud TPU teardown is incomplete; retaining cluster state. '
+                f'Requests: {list(remaining_requests)}; '
+                f'nodes: {list(remaining_nodes)}')
     # We don't wait for the instances to be terminated, as it can take a long
     # time (same as what we did in ray's node_provider).
 

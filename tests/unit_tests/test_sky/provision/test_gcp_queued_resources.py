@@ -12,6 +12,7 @@ from sky.provision import common
 from sky.provision import constants as provision_constants
 from sky.provision.gcp import instance
 from sky.provision.gcp import instance_utils
+from sky.utils import status_lib
 
 PROJECT = 'test-project'
 ZONE = 'us-central2-b'
@@ -69,6 +70,17 @@ def tpu_api(monkeypatch):
     }
     queued.list.return_value.execute.return_value = {'queuedResources': []}
     queued.list_next.return_value = None
+
+    # A successful deletion removes the request from subsequent inventories.
+    def delete_request(name, force):
+        del force
+        response = queued.list.return_value.execute.return_value
+        response['queuedResources'] = [
+            r for r in response.get('queuedResources', []) if r['name'] != name
+        ]
+        return mock.DEFAULT
+
+    queued.delete.side_effect = delete_request
     queued.delete.return_value.execute.return_value = {
         'name': f'{PARENT}/operations/delete-request',
     }
@@ -374,6 +386,7 @@ def test_standard_tpu_vm_termination_is_unchanged(tpu_api):
     (['READY', 'PREEMPTED'], False),
     (['PREEMPTED'], True),
 ])
+@pytest.mark.usefixtures('tpu_api')
 def test_status_query_only_terminates_observed_preempted_nodes(
         monkeypatch, states, should_terminate):
     nodes = {
@@ -389,3 +402,91 @@ def test_status_query_only_terminates_observed_preempted_nodes(
     instance.query_instances(CLUSTER, CLUSTER, PROVIDER_CONFIG)
 
     assert terminate.called == should_terminate
+
+
+@pytest.mark.parametrize('state,expected', [
+    ('ACCEPTED', status_lib.ClusterStatus.INIT),
+    ('WAITING_FOR_RESOURCES', status_lib.ClusterStatus.INIT),
+    ('PROVISIONING', status_lib.ClusterStatus.INIT),
+    ('ACTIVE', status_lib.ClusterStatus.INIT),
+    ('FAILED', status_lib.ClusterStatus.STOPPED),
+    ('SUSPENDED', status_lib.ClusterStatus.STOPPED),
+])
+def test_status_retains_requests_without_nodes(tpu_api, state, expected):
+    queued = tpu_api.projects().locations().queuedResources()
+    request = _queued_resource(state=state)
+    queued.list.return_value.execute.return_value = {
+        'queuedResources': [
+            request, _queued_resource('foreign', cluster='other')
+        ]
+    }
+
+    result = instance.query_instances(CLUSTER, CLUSTER, PROVIDER_CONFIG)
+
+    assert result == {f'{PARENT}/nodes/{CLUSTER}-head-tpu': (expected, None)}
+    queued.delete.assert_not_called()
+
+
+def test_status_preserves_ready_nodes_and_missing_worker_request(tpu_api):
+    locations = tpu_api.projects().locations()
+    head = _queued_resource()
+    worker = _queued_resource('worker', kind='worker', state='ACCEPTED')
+    node_name = f'{PARENT}/nodes/{CLUSTER}-head-tpu'
+    locations.nodes().list.return_value.execute.return_value = {
+        'nodes': [{
+            'name': node_name,
+            'state': 'READY',
+            'labels': LABELS
+        }]
+    }
+    locations.queuedResources().list.return_value.execute.return_value = {
+        'queuedResources': [head, worker]
+    }
+
+    assert instance.query_instances(CLUSTER, CLUSTER, PROVIDER_CONFIG) == {
+        node_name: (status_lib.ClusterStatus.UP, None),
+        f'{PARENT}/nodes/{CLUSTER}-worker-tpu':
+            (status_lib.ClusterStatus.INIT, None),
+    }
+
+
+def test_cancel_before_node_creation_keeps_cleanup_route(
+        tpu_api, wait_for_operation, monkeypatch):
+    monkeypatch.setattr(instance_utils.GCPComputeInstance, 'filter',
+                        mock.Mock(return_value={}))
+    queued = tpu_api.projects().locations().queuedResources()
+    request = _queued_resource(state='WAITING_FOR_RESOURCES')
+    queued.list.return_value.execute.return_value = {
+        'queuedResources': [request]
+    }
+
+    # A nonempty result prevents status refresh from deleting the handle.
+    assert instance.query_instances(CLUSTER, CLUSTER, PROVIDER_CONFIG)
+    instance.terminate_instances(CLUSTER, PROVIDER_CONFIG)
+
+    queued.delete.assert_called_once_with(name=request['name'], force=True)
+    wait_for_operation.assert_called_once()
+    assert not instance.query_instances(CLUSTER, CLUSTER, PROVIDER_CONFIG)
+
+
+@pytest.mark.parametrize('leftover', ['request', 'node', 'inventory-error'])
+@pytest.mark.usefixtures('tpu_api', 'wait_for_operation')
+def test_teardown_cannot_succeed_with_unverified_cloud_cleanup(
+        monkeypatch, leftover):
+    monkeypatch.setattr(instance, '_filter_instances',
+                        mock.Mock(return_value={}))
+    requests = mock.Mock(return_value={})
+    if leftover == 'request':
+        requests.return_value = {'remaining': _queued_resource()}
+    elif leftover == 'node':
+        monkeypatch.setattr(instance_utils.GCPTPUVMInstance, 'filter',
+                            mock.Mock(return_value={'remaining': {}}))
+    else:
+        requests.side_effect = _http_error(403)
+    monkeypatch.setattr(instance_utils.GCPTPUVMInstance,
+                        'terminate_queued_resources', mock.Mock())
+    monkeypatch.setattr(instance_utils.GCPTPUVMInstance,
+                        'filter_queued_resources', requests)
+
+    with pytest.raises((common.ProvisionerError, errors.HttpError)):
+        instance.terminate_instances(CLUSTER, PROVIDER_CONFIG)
