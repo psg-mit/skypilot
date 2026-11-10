@@ -202,7 +202,7 @@ def _validate(resource: dict, name: str, row: dict) -> None:
     if (row.get('create_time') is not None and
             row['create_time'] != resource['createTime']):
         raise ValueError('provider generation changed')
-    if ('spot' in expected) != ('spot' in resource):
+    if _spot_route(expected) != _spot_route(resource):
         raise ValueError('TPU route changed')
     actual_specs, expected_specs = _specs(resource), _specs(expected)
     if len(actual_specs) != len(expected_specs):
@@ -216,6 +216,19 @@ def _validate(resource: dict, name: str, row: dict) -> None:
         for key in ('acceleratorType', 'runtimeVersion', 'labels'):
             if node.get(key) != desired_node.get(key):
                 raise ValueError(f'TPU {key} changed')
+
+
+def _spot_route(resource: dict) -> bool:
+    # v2alpha1 canonicalizes the submitted spot tier to bestEffort + SPOT.
+    # bestEffort alone does not establish Spot entitlement or quota usage.
+    model = resource.get('provisioningModel')
+    if model not in (None, 'PROVISIONING_MODEL_UNSPECIFIED', 'STANDARD',
+                     'SPOT'):
+        raise ValueError('Unsupported TPU provisioning model')
+    if (('spot' in resource and model == 'STANDARD') or
+        ('guaranteed' in resource and ('spot' in resource or model == 'SPOT'))):
+        raise ValueError('Conflicting TPU route fields')
+    return 'spot' in resource or model == 'SPOT'
 
 
 def _resources():

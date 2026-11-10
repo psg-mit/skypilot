@@ -361,3 +361,24 @@ def test_lost_create_without_resource_cannot_be_declared_clean(queue):
         wait.validate_teardown(PROJECT, ZONE, CLUSTER, {})
     with pytest.raises(common.ProvisionerError):
         wait.retire(PROJECT, ZONE, CLUSTER)
+
+
+@pytest.mark.parametrize('model,guaranteed,valid',
+                         [('SPOT', False, True), ('STANDARD', False, False),
+                          ('SPOT', True, False),
+                          ('RESERVATION_BOUND', False, False),
+                          (None, False, False)])
+def test_provider_canonical_spot_route_is_explicitly_fenced(
+        queue, model, guaranteed, valid):
+    _, resources = queue
+    with pytest.raises(exceptions.ExecutionPausedError):
+        _create()
+    resource = next(iter(resources.values()))
+    resource.pop('spot')
+    resource['bestEffort'] = {}
+    if model is not None:
+        resource['provisioningModel'] = model
+    if guaranteed:
+        resource['guaranteed'] = {}
+    resource['state']['state'] = 'ACTIVE'
+    assert wait.check(_path()) == valid
