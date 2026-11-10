@@ -490,3 +490,153 @@ def test_teardown_cannot_succeed_with_unverified_cloud_cleanup(
 
     with pytest.raises((common.ProvisionerError, errors.HttpError)):
         instance.terminate_instances(CLUSTER, PROVIDER_CONFIG)
+
+
+class _QueuedResourceClock:
+    """Advance only on sleeps; avoid changing Python's shared time module."""
+
+    def __init__(self):
+        self.now = 0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def queued_resource_clock(monkeypatch):
+    clock = _QueuedResourceClock()
+    monkeypatch.setattr(instance_utils, 'time', clock)
+    monkeypatch.setattr(instance_utils, 'GCP_QUEUED_RESOURCE_TIMEOUT', 100)
+    monkeypatch.setattr(instance_utils,
+                        'GCP_QUEUED_RESOURCE_PROVISIONING_GRACE', 15)
+    monkeypatch.setattr(instance_utils.constants, 'POLL_INTERVAL', 1)
+    return clock
+
+
+def test_queued_resource_late_provisioning_can_finish(tpu_api,
+                                                      queued_resource_clock):
+    queued = tpu_api.projects().locations().queuedResources()
+
+    def response():
+        now = queued_resource_clock.now
+        state = ('WAITING_FOR_RESOURCES'
+                 if now < 99 else 'PROVISIONING' if now < 103 else 'ACTIVE')
+        return _queued_resource(state=state)
+
+    queued.get.return_value.execute.side_effect = response
+    instance_utils.GCPTPUVMInstance.wait_for_queued_resource(
+        PROJECT, ZONE, 'request')
+
+    assert queued_resource_clock.now == 103
+    queued.get.assert_called_with(name=f'{PARENT}/queuedResources/request')
+    queued.delete.assert_not_called()
+
+
+@pytest.mark.parametrize('state',
+                         ['WAITING_FOR_RESOURCES', 'ACCEPTED', 'CREATING'])
+def test_queued_resource_wait_keeps_queue_timeout(tpu_api,
+                                                  queued_resource_clock, state):
+    queued = tpu_api.projects().locations().queuedResources()
+    queued.get.return_value.execute.return_value = _queued_resource(state=state)
+
+    with pytest.raises(common.ProvisionerError, match='Timed out') as caught:
+        instance_utils.GCPTPUVMInstance.wait_for_queued_resource(
+            PROJECT, ZONE, 'request')
+
+    assert queued_resource_clock.now == 100
+    assert caught.value.errors[0]['code'] == 'TIMEOUT'
+
+
+@pytest.mark.parametrize(('provision_at', 'deadline'), [(0, 100), (90, 105),
+                                                        (99, 114)])
+def test_queued_resource_provisioning_grace_is_bounded(tpu_api,
+                                                       queued_resource_clock,
+                                                       provision_at, deadline):
+    queued = tpu_api.projects().locations().queuedResources()
+    queued.get.return_value.execute.side_effect = lambda: _queued_resource(
+        state=('WAITING_FOR_RESOURCES'
+               if queued_resource_clock.now < provision_at else 'PROVISIONING'))
+
+    with pytest.raises(common.ProvisionerError, match='Timed out'):
+        instance_utils.GCPTPUVMInstance.wait_for_queued_resource(
+            PROJECT, ZONE, 'request')
+
+    assert queued_resource_clock.now == deadline
+
+
+def test_queued_resource_state_flaps_do_not_reset_grace(tpu_api,
+                                                        queued_resource_clock):
+    queued = tpu_api.projects().locations().queuedResources()
+
+    def response():
+        now = queued_resource_clock.now
+        state = ('WAITING_FOR_RESOURCES'
+                 if now < 99 or now % 2 == 0 else 'PROVISIONING')
+        return _queued_resource(state=state)
+
+    queued.get.return_value.execute.side_effect = response
+    with pytest.raises(common.ProvisionerError, match='Timed out'):
+        instance_utils.GCPTPUVMInstance.wait_for_queued_resource(
+            PROJECT, ZONE, 'request')
+
+    assert queued_resource_clock.now == 114
+
+
+def test_queued_resource_api_failures_do_not_reset_grace(
+        tpu_api, queued_resource_clock):
+    queued = tpu_api.projects().locations().queuedResources()
+
+    def response():
+        now = queued_resource_clock.now
+        if now > 99:
+            raise RuntimeError('temporary status read failure')
+        return _queued_resource(
+            state=('WAITING_FOR_RESOURCES' if now < 99 else 'PROVISIONING'))
+
+    queued.get.return_value.execute.side_effect = response
+    with pytest.raises(common.ProvisionerError, match='Timed out'):
+        instance_utils.GCPTPUVMInstance.wait_for_queued_resource(
+            PROJECT, ZONE, 'request')
+
+    assert queued_resource_clock.now == 114
+
+
+def test_queued_resource_failed_is_terminal_during_grace(
+        tpu_api, queued_resource_clock):
+    queued = tpu_api.projects().locations().queuedResources()
+
+    def response():
+        now = queued_resource_clock.now
+        state = ('WAITING_FOR_RESOURCES'
+                 if now < 99 else 'PROVISIONING' if now < 103 else 'FAILED')
+        resource = _queued_resource(state=state)
+        resource['status'] = {'code': 7, 'message': 'test provider failure'}
+        return resource
+
+    queued.get.return_value.execute.side_effect = response
+    with pytest.raises(common.ProvisionerError,
+                       match='test provider failure') as caught:
+        instance_utils.GCPTPUVMInstance.wait_for_queued_resource(
+            PROJECT, ZONE, 'request')
+
+    assert queued_resource_clock.now == 103
+    assert caught.value.errors == [{
+        'code': 7,
+        'message': 'test provider failure',
+        'domain': 'queued_resource',
+    }]
+
+
+def test_queued_resource_active_returns_immediately(tpu_api,
+                                                    queued_resource_clock):
+    queued = tpu_api.projects().locations().queuedResources()
+    queued.get.return_value.execute.return_value = _queued_resource()
+
+    instance_utils.GCPTPUVMInstance.wait_for_queued_resource(
+        PROJECT, ZONE, 'request')
+
+    assert queued_resource_clock.now == 0
+    queued.get.return_value.execute.assert_called_once_with()

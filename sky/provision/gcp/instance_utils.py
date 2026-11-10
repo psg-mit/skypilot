@@ -33,6 +33,7 @@ GCP_CREATE_MAX_RETRIES = 5
 GCP_RETRY_INTERVAL_SECONDS = 5
 GCP_TIMEOUT = 300
 GCP_QUEUED_RESOURCE_TIMEOUT = 6000
+GCP_QUEUED_RESOURCE_PROVISIONING_GRACE = 900  # 15 minutes
 
 logger = sky_logging.init_logger(__name__)
 
@@ -1706,8 +1707,10 @@ class GCPTPUVMInstance(GCPInstance):
                 name=f'projects/{project_id}/locations/{zone}/queuedResources/'
                 f'{queued_resource_id}').execute()
 
-        wait_start = time.time()
-        while time.time() - wait_start < GCP_QUEUED_RESOURCE_TIMEOUT:
+        queue_deadline = time.monotonic() + GCP_QUEUED_RESOURCE_TIMEOUT
+        provisioning_deadline: Optional[float] = None
+        while time.monotonic() < max(queue_deadline, provisioning_deadline or
+                                     queue_deadline):
             try:
                 qr = get_queued_resource()
             except Exception as e:  # pylint: disable=broad-except
@@ -1717,6 +1720,12 @@ class GCPTPUVMInstance(GCPInstance):
                 continue
 
             state = qr.get('state', {}).get('state')
+            if state == 'PROVISIONING' and provisioning_deadline is None:
+                # A long queue wait can leave a newly allocated TPU only seconds
+                # to boot. Give the first observed provisioning transition a
+                # bounded grace period without resetting it on state flaps.
+                provisioning_deadline = (time.monotonic() +
+                                         GCP_QUEUED_RESOURCE_PROVISIONING_GRACE)
 
             # Values: STATE_UNSPECIFIED, CREATING, ACCEPTED, PROVISIONING,
             # FAILED, DELETING, ACTIVE, SUSPENDING, SUSPENDED,
