@@ -34,6 +34,7 @@ from sky.server import daemons
 from sky.server import versions
 from sky.server.blob import blob_storage as bs
 from sky.server.requests import payloads
+from sky.server.requests import restart_recovery
 from sky.server.requests import storage as request_storage
 from sky.server.requests.serializers import decoders
 from sky.server.requests.serializers import encoders
@@ -684,6 +685,11 @@ def request_log_dirs() -> Tuple[pathlib.Path, ...]:
 
 def reset_db_and_logs():
     """Clear local state and re-initialize the request storage backend."""
+    if restart_recovery.enabled():
+        # Recovery needs original request bodies, task uploads and logs as well
+        # as their IDs. Never run the ephemeral-store reset in this mode.
+        request_storage.get_request_backend().reset_on_startup()
+        return
     logger.debug('clearing local API server database')
     server_common.clear_local_api_server_database()
     for log_dir in request_log_dirs():

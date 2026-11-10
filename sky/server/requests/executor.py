@@ -26,6 +26,7 @@ import inspect
 import multiprocessing
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -1425,6 +1426,12 @@ def start(
         A tuple of the queue server process and the list of request worker
         threads.
     """
+    # Continue conditions also run in this supervisor's waiter threads. Give
+    # each probe the same isolated environment support as HTTP coroutines;
+    # otherwise applying one request's credentials would mutate the server env.
+    if not isinstance(os.environ, context.ContextualEnviron):
+        setattr(os, 'environ', context.ContextualEnviron(os.environ))
+        setattr(subprocess, 'Popen', context.Popen)
     global _queue_factory
     factory = queue_base.get_queue_backend_factory()
     # Use specified factory if any, and fallback to default impl
@@ -1439,6 +1446,16 @@ def start(
 
     queue_server = _queue_factory.start()
     logger.info('Request queues created')
+
+    # Before controllers or HTTP traffic can observe an interrupted launch,
+    # restore eligible original IDs to the new, empty in-memory queue.
+    # pylint: disable=import-outside-toplevel
+    from sky.server.requests import restart_recovery
+    restart_recovery.recover(
+        lambda request: _get_queue(request.schedule_type).put(
+            (request.request_id, False,
+             daemons.is_daemon_request_id(request.request_id) or getattr(
+                 request.request_body, 'retry_until_up', False))))
 
     workers = []
     # Start a worker for long requests.

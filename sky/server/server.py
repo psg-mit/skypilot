@@ -4493,7 +4493,6 @@ if __name__ == '__main__':
         # sky/jobs/managed_job_refresh_thread.py for details.
         # pylint: disable=import-outside-toplevel
         from sky.jobs import managed_job_refresh_thread
-        managed_job_refresh_thread.start_managed_job_refresh_daemon()
 
         # Snapshot a clean copy of os.environ BEFORE spawning workers and
         # before any per-request env mutation can happen. Used when
@@ -4505,6 +4504,7 @@ if __name__ == '__main__':
         clean_env_module.capture_clean_server_env()
 
         queue_server, workers = executor.start(config)
+        managed_job_refresh_thread.start_managed_job_refresh_daemon()
 
         logger.info(f'Starting SkyPilot API server, workers={num_workers}')
         # We don't support reload for now, since it may cause leakage of request

@@ -173,6 +173,10 @@ def test_repeated_queued_resource_cleanup(tpu_api, wait_for_operation):
         'queuedResources': [resource]
     }, {
         'queuedResources': []
+    }, {
+        'queuedResources': []
+    }, {
+        'queuedResources': []
     }]
 
     for _ in range(2):

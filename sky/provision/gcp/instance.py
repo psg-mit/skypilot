@@ -13,6 +13,7 @@ from sky.provision import constants as provision_constants
 from sky.provision.gcp import config as gcp_config
 from sky.provision.gcp import constants
 from sky.provision.gcp import instance_utils
+from sky.provision.gcp import queued_resource_wait
 from sky.utils import common_utils
 from sky.utils import resources_utils
 from sky.utils import status_lib
@@ -199,6 +200,18 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
     filter_labels = {
         provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
     }
+
+    # A parked queued allocation may have no nodes, or only part of its nodes.
+    # Resume the original allocation group before counting nodes or generating
+    # names, so neither case can cause another create.
+    if (node_type == instance_utils.GCPNodeType.TPU and
+            config.node_config.get('gcp_queued_resource')):
+        journal = queued_resource_wait.open_journal(
+            project_id, availability_zone, cluster_name_on_cloud,
+            queued_resource_wait.contract(config.node_config, labels,
+                                          config.count))
+        if journal is not None and journal.exists():
+            created_instance_ids = queued_resource_wait.create(journal)
 
     # wait until all stopping instances are stopped/terminated
     while True:

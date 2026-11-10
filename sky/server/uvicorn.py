@@ -25,6 +25,7 @@ from sky.server import daemons
 from sky.server import metrics as metrics_lib
 from sky.server import state
 from sky.server.requests import requests as requests_lib
+from sky.server.requests import restart_recovery
 from sky.server.requests import storage as request_storage
 from sky.skylet import constants
 from sky.utils import context_utils
@@ -302,11 +303,19 @@ class Server(uvicorn.Server):
         with requests_lib.update_request(request_id) as req:
             if req is None:
                 return
+            preserve = (restart_recovery.enabled() and
+                        restart_recovery.resumable(req))
             if req.pid is not None:
                 try:
                     os.kill(req.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     logger.debug(f'Process {req.pid} already finished.')
+            if preserve:
+                req.pid = None
+                if req.status != requests_lib.RequestStatus.PENDING:
+                    req.status = requests_lib.RequestStatus.WAITING
+                req.status_msg = 'Parked for API server restart'
+                return
             req.status = requests_lib.RequestStatus.CANCELLED
             req.should_retry = should_retry
             # Stamp finished_at: retention cleanup selects finished

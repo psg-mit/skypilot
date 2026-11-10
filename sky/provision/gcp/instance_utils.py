@@ -17,6 +17,7 @@ from sky.provision import common
 from sky.provision import constants as provision_constants
 from sky.provision.gcp import constants
 from sky.provision.gcp import mig_utils
+from sky.provision.gcp import queued_resource_wait
 from sky.utils import common_utils
 from sky.utils import ux_utils
 
@@ -1593,6 +1594,9 @@ class GCPTPUVMInstance(GCPInstance):
                                    label_filters: Dict[str, str]) -> None:
         """Delete owned requests and their nodes, waiting for completion."""
         requests = cls.filter_queued_resources(project_id, zone, label_filters)
+        queued_resource_wait.validate_teardown(
+            project_id, zone,
+            label_filters[provision_constants.TAG_RAY_CLUSTER_NAME], requests)
         resources = cls.load_resource().projects().locations().queuedResources()
         for name in requests:
             try:
@@ -1606,6 +1610,12 @@ class GCPTPUVMInstance(GCPInstance):
                 logger.debug(f'Queued resource {name} was already deleted.')
                 continue
             cls.wait_for_operation(operation, project_id, zone=zone)
+        if (set(label_filters) == {
+                provision_constants.TAG_RAY_CLUSTER_NAME
+        } and not cls.filter_queued_resources(project_id, zone, label_filters)):
+            queued_resource_wait.retire(
+                project_id, zone,
+                label_filters[provision_constants.TAG_RAY_CLUSTER_NAME])
 
     @classmethod
     def add_network_tag_if_not_exist(
@@ -1774,6 +1784,14 @@ class GCPTPUVMInstance(GCPInstance):
         total_count: int,
         include_head_node: bool,
     ) -> Tuple[Optional[List], List[str]]:
+        journal = None
+        expected = queued_resource_wait.contract(node_config, labels,
+                                                 total_count)
+        if node_config.get('gcp_queued_resource'):
+            journal = queued_resource_wait.open_journal(project_id, zone,
+                                                        cluster_name, expected)
+            if journal is not None and journal.exists():
+                return None, queued_resource_wait.create(journal)
         config = copy.deepcopy(node_config)
         # removing Compute-specific default key set in config.py
         config.pop('networkInterfaces', None)
@@ -1804,6 +1822,23 @@ class GCPTPUVMInstance(GCPInstance):
                 'TPU VMs do not support reservations yet.')
 
         if config.get('gcp_queued_resource'):
+            if journal is not None:
+                bodies = {}
+                parent = f'projects/{project_id}/locations/{zone}'
+                for i, name in enumerate(names):
+                    node = copy.deepcopy(config)
+                    node.pop('gcp_queued_resource')
+                    node['labels'].update(provision_constants.HEAD_NODE_TAGS
+                                          if i == 0 and include_head_node else
+                                          provision_constants.WORKER_NODE_TAGS)
+                    body = dict(tpu=dict(
+                        nodeSpec=dict(parent=parent, nodeId=name, node=node)))
+                    if node.pop('schedulingConfig', {}).get('preemptible'):
+                        body['spot'] = {}
+                    bodies[f'{parent}/queuedResources/{name}-q'] = body
+                queued_resource_wait.prepare(journal, project_id, zone,
+                                             cluster_name, expected, bodies)
+                return None, queued_resource_wait.create(journal)
             return cls._create_queued_resource_instances(
                 names, project_id, zone, config)
         else:
