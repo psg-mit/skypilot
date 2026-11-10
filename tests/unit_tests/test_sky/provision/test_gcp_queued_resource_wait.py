@@ -41,6 +41,8 @@ def _http_error(status):
 @pytest.fixture
 def queue(monkeypatch, tmp_path):
     monkeypatch.setattr(wait, 'JOURNAL_ROOT', tmp_path / 'waits')
+    monkeypatch.setattr(wait, 'native_cluster_hash',
+                        lambda: 'native-generation')
     monkeypatch.setattr(wait, 'canonical_parent',
                         lambda project, zone: f'projects/123/locations/{zone}')
     monkeypatch.setattr(common_utils, 'is_in_request_context', lambda: True)

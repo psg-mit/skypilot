@@ -191,8 +191,24 @@ def prepare(path: pathlib.Path, project: str, zone: str, cluster: str,
                                 canonical_parent=canonical)
                      for name, body in bodies.items()
                  })
+    try:
+        value['native_cluster_hash'] = native_cluster_hash()
+    except Exception:  # pylint: disable=broad-except
+        pause(path, 'Native cluster identity unavailable; no create sent')
     save(path, value)
     return value
+
+
+def native_cluster_hash() -> Optional[str]:
+    """Authoritative generation for completed-launch controller reattachment."""
+    # These imports would form a requests/provision initialization cycle.
+    # pylint: disable=import-outside-toplevel
+    from sky import global_user_state
+    from sky.server.requests import requests
+    request = requests.get_request(common_utils.get_current_request_id())
+    if request is None or not request.cluster_name:
+        return None
+    return global_user_state.get_cluster_hash(request.cluster_name)
 
 
 def _specs(body: dict) -> list:

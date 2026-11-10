@@ -331,6 +331,45 @@ async def test_launch_parks_and_reattaches_without_teardown(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_controller_restart_reattaches_original_launch_without_cleanup(
+        monkeypatch):
+    executor = _make_launch_executor()
+    patches = _patch_launch_environment(monkeypatch)
+    monkeypatch.setenv(recovery_strategy.restart_recovery.ENV_VAR, '1')
+    monkeypatch.setattr(recovery_strategy.restart_recovery,
+                        'managed_launch_request', lambda *args: 'original')
+    executor._wait_for_parked_request = mock.AsyncMock(return_value='original')
+    executor._await_launch_request = mock.AsyncMock()
+    assert await executor.prepare_launch_resume()
+    assert await executor._launch(max_retry=1) == 123.45
+    patches.sdk_launch.assert_not_called()
+    executor._cleanup_cluster.assert_not_called()
+    assert executor._await_launch_request.call_args.args[0] == 'original'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cancelling', [False, True])
+async def test_restart_gate_preserves_launch_but_honors_user_cancel(
+        monkeypatch, tmp_path, cancelling):
+    executor = _make_launch_executor()
+    monkeypatch.setenv(recovery_strategy.restart_recovery.ENV_VAR, '1')
+    signal = tmp_path / 'restarting'
+    signal.touch()
+    monkeypatch.setattr(recovery_strategy.constants,
+                        'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE', str(signal))
+    status = (recovery_strategy.state.ManagedJobStatus.CANCELLING if cancelling
+              else recovery_strategy.state.ManagedJobStatus.STARTING)
+    monkeypatch.setattr(recovery_strategy.state,
+                        'get_job_status_with_task_id_async',
+                        mock.AsyncMock(return_value=status))
+    cancel = mock.Mock(return_value='cancel-receipt')
+    monkeypatch.setattr(recovery_strategy.sdk, 'api_cancel', cancel)
+    monkeypatch.setattr(recovery_strategy.sdk, 'get', mock.Mock())
+    await executor._cancel_launch_request('original')
+    assert cancel.called == cancelling
+
+
+@pytest.mark.asyncio
 async def test_launch_parking_does_not_consume_retry_budget(monkeypatch):
     """Park cycles must not count against max_retry."""
     executor = _make_launch_executor()

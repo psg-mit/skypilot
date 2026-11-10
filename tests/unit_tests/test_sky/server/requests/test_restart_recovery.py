@@ -8,6 +8,8 @@ from unittest import mock
 import pytest
 import uvicorn
 
+from sky.jobs import state
+from sky.provision import observation
 from sky.provision.gcp import queued_resource_wait as wait
 from sky.server import uvicorn as sky_uvicorn
 from sky.server.requests import requests
@@ -106,3 +108,59 @@ def test_graceful_restart_preserves_wait_instead_of_cancelling(
     assert request.pid is None
     assert request.request_id == 'original'
     signal.assert_called_once()
+
+
+@pytest.mark.parametrize('status',
+                         ['PENDING', 'WAITING', 'RUNNING', 'SUCCEEDED'])
+def test_managed_controller_finds_exact_original_request(
+        enabled, monkeypatch, status):
+    from sky import global_user_state  # pylint: disable=import-outside-toplevel
+    monkeypatch.setattr(state, 'get_job_info_row',
+                        lambda _: SimpleNamespace(user_hash='owner'))
+    body = SimpleNamespace(is_launched_by_jobs_controller=True,
+                           extra_launch_context={
+                               observation.LAUNCH_CONTEXT_KEY:
+                                   state.provisioning_observation_target(10, 0)
+                           })
+    request = SimpleNamespace(request_id='original',
+                              name='sky.launch',
+                              status=requests.RequestStatus[status],
+                              user_id='owner',
+                              cluster_name='exact-cluster',
+                              request_body=body)
+    monkeypatch.setattr(requests, 'get_request_tasks', lambda _: [request])
+    monkeypatch.setattr(global_user_state, 'get_cluster_hash', lambda _: 'hash')
+    wait.save(
+        wait.JOURNAL_ROOT / 'ready.json',
+        dict(request_id='original', stage='ready', native_cluster_hash='hash'))
+    assert recovery.managed_launch_request(10, 0, 'exact-cluster') == 'original'
+    request.user_id = 'foreign'
+    assert recovery.managed_launch_request(10, 0, 'exact-cluster') is None
+    request.user_id = 'owner'
+    body.extra_launch_context[observation.LAUNCH_CONTEXT_KEY]['task_id'] = 1
+    if status == 'SUCCEEDED':
+        assert recovery.managed_launch_request(10, 0, 'exact-cluster') is None
+    else:
+        with pytest.raises(ValueError, match='task binding'):
+            recovery.managed_launch_request(10, 0, 'exact-cluster')
+
+
+def test_ambiguous_managed_requests_never_choose_or_relaunch(
+        enabled, monkeypatch):
+    monkeypatch.setattr(state, 'get_job_info_row',
+                        lambda _: SimpleNamespace(user_hash='owner'))
+    body = SimpleNamespace(is_launched_by_jobs_controller=True,
+                           extra_launch_context={
+                               observation.LAUNCH_CONTEXT_KEY:
+                                   state.provisioning_observation_target(10, 0)
+                           })
+    rows = [
+        SimpleNamespace(request_id=str(i),
+                        user_id='owner',
+                        cluster_name='cluster',
+                        request_body=body,
+                        status=requests.RequestStatus.WAITING) for i in range(2)
+    ]
+    monkeypatch.setattr(requests, 'get_request_tasks', lambda _: rows)
+    with pytest.raises(ValueError, match='Multiple'):
+        recovery.managed_launch_request(10, 0, 'cluster')

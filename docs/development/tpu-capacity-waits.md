@@ -20,6 +20,13 @@ journaled capacity waits, before managed controller recovery starts. Requests
 that already left the capacity-wait phase require reconciliation and are not
 automatically replayed. User cancellation remains terminal.
 
+Consolidated managed controllers reattach to the original API launch before
+recovery cleanup. The stored request must match the exact native job/task
+observation target, owner and cluster name. Completed launches also require
+the current native cluster generation. Ambiguous bindings wait for
+reconciliation. During the native restart gate, controller shutdown preserves
+in-flight launches; an explicit CANCELLING task still cancels its request.
+
 Before the first upgrade from a version without these journals, audit every
 running launch against its native launch attempt, cluster generation, original
 creation log, immutable task, and exact provider request incarnation. Import

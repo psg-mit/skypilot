@@ -771,6 +771,20 @@ class JobController:
             self.starting_lock,
             self.starting_signal,
             file_mounts_blob_id=file_mounts_blob_id)
+        # A controller restart may find a task PENDING because its launch
+        # parked, or STARTING because it had not observed the park yet. Attach
+        # the exact native request before resetting metadata or forcing cleanup.
+        resume_status = await (
+            managed_job_state.get_job_status_with_task_id_async(
+                job_id=self._job_id, task_id=task_id))
+        resume_original_launch = False
+        if resume_status in (managed_job_state.ManagedJobStatus.PENDING,
+                             managed_job_state.ManagedJobStatus.STARTING,
+                             managed_job_state.ManagedJobStatus.RECOVERING):
+            resume_original_launch = await (
+                self._strategy_executor.prepare_launch_resume())
+        if resume_original_launch:
+            is_resume = True
         if not is_resume:
             submitted_at = time.time()
             if task_id == 0:
@@ -804,7 +818,7 @@ class JobController:
         # Only do the initial cluster launch if not resuming from a controller
         # failure. Otherwise, we will transit to recovering immediately.
         remote_job_submitted_at = time.time()
-        if not is_resume:
+        if not is_resume or resume_original_launch:
             launch_start = time.time()
 
             # Run the launch in a separate thread to avoid blocking the event
@@ -865,7 +879,7 @@ class JobController:
         # If resuming from a controller failure, check the previous state
         # and determine if we need to force recovery.
         force_transit_to_recovering = False
-        if is_resume:
+        if is_resume and not resume_original_launch:
             prev_status = await (
                 managed_job_state.get_job_status_with_task_id_async(
                     job_id=self._job_id, task_id=task_id))

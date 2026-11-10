@@ -10,6 +10,7 @@ import concurrent.futures
 import contextlib
 import logging
 import os
+import pathlib
 import re
 import traceback
 import typing
@@ -33,6 +34,7 @@ from sky.provision import observation as provision_observation
 from sky.serve import serve_utils
 from sky.server import common as server_common
 from sky.server.requests import requests as requests_lib
+from sky.server.requests import restart_recovery
 from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.usage import usage_lib
@@ -300,6 +302,24 @@ class StrategyExecutor:
         self.starting_lock = starting_lock
         self.starting_signal = starting_signal
         self.file_mounts_blob_id = file_mounts_blob_id
+        self._resume_launch_request_id: Optional[str] = None
+
+    async def prepare_launch_resume(self) -> bool:
+        """Bind the original managed launch before any recovery cleanup."""
+        if (not restart_recovery.enabled() or self.pool is not None or
+                self.cluster_name is None):
+            return False
+        while True:
+            try:
+                request_id = await asyncio.to_thread(
+                    restart_recovery.managed_launch_request, self.job_id,
+                    self.task_id, self.cluster_name)
+                self._resume_launch_request_id = request_id
+                return request_id is not None
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning('Managed launch reconciliation unavailable; '
+                               f'preserving original requests: {error}')
+                await asyncio.sleep(_LAUNCH_REQUEST_STATUS_POLL_SECONDS)
 
     def set_strategy_config(self, config: dict) -> None:
         """Handle strategy-specific config from the job_recovery dict.
@@ -722,6 +742,15 @@ class StrategyExecutor:
 
     async def _cancel_launch_request(self, request_id: str) -> None:
         """Cancel an inner launch/exec request of this job."""
+        if (restart_recovery.enabled() and
+                pathlib.Path(constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE
+                            ).expanduser().exists()):
+            status = await state.get_job_status_with_task_id_async(
+                job_id=self.job_id, task_id=self.task_id)
+            if (status is not None and not status.is_terminal() and
+                    status != state.ManagedJobStatus.CANCELLING):
+                logger.info(f'Preserving launch {request_id} for API restart')
+                return
         try:
             req = await asyncio.to_thread(sdk.api_cancel, request_id)
         except Exception as e:  # pylint: disable=broad-except
@@ -969,7 +998,13 @@ class StrategyExecutor:
         # try/except once it takes ownership of the request. While set, the
         # asyncio.CancelledError handler below cancels the outstanding
         # request if the job is cancelled.
-        parked_request_id: Optional[str] = None
+        if not recovery and restart_recovery.enabled() and not getattr(
+                self, '_resume_launch_request_id', None):
+            await self.prepare_launch_resume()
+        parked_request_id: Optional[str] = getattr(self,
+                                                   '_resume_launch_request_id',
+                                                   None)
+        self._resume_launch_request_id = None
         parked_stream_task: Optional['asyncio.Future'] = None
         parked_reason: Optional[str] = None
         while True:
@@ -1131,6 +1166,11 @@ class StrategyExecutor:
                                     parked_stream_task = None
                                     logger.info('Re-attaching to launch '
                                                 f'request {request_id}.')
+                                    if stream_task is None:
+                                        # A restarted controller has the
+                                        # durable ID but no in-memory stream.
+                                        stream_task = self._start_stream_task(
+                                            request_id)
                                     if (stream_task is not None and
                                             stream_task.done() and
                                             stream_task.exception()
