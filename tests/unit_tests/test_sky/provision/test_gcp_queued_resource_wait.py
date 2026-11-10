@@ -41,6 +41,8 @@ def _http_error(status):
 @pytest.fixture
 def queue(monkeypatch, tmp_path):
     monkeypatch.setattr(wait, 'JOURNAL_ROOT', tmp_path / 'waits')
+    monkeypatch.setattr(wait, 'canonical_parent',
+                        lambda project, zone: f'projects/123/locations/{zone}')
     monkeypatch.setattr(common_utils, 'is_in_request_context', lambda: True)
     monkeypatch.setattr(common_utils, 'get_current_request_id',
                         lambda: 'original')
@@ -382,3 +384,36 @@ def test_provider_canonical_spot_route_is_explicitly_fenced(
         resource['guaranteed'] = {}
     resource['state']['state'] = 'ACTIVE'
     assert wait.check(_path()) == valid
+
+
+@pytest.mark.parametrize('parent,valid',
+                         [(f'projects/123/locations/{ZONE}', True),
+                          (f'projects/456/locations/{ZONE}', False),
+                          ('projects/123/locations/other-zone', False),
+                          (None, False)])
+def test_numeric_project_parent_requires_verified_alias(queue, parent, valid):
+    _, resources = queue
+    with pytest.raises(exceptions.ExecutionPausedError):
+        _create()
+    resource = next(iter(resources.values()))
+    resource['tpu']['nodeSpec'][0]['parent'] = parent
+    resource['state']['state'] = 'ACTIVE'
+    assert wait.check(_path()) == valid
+
+
+@pytest.mark.parametrize('project_id,number,valid', [(PROJECT, '123', True),
+                                                     ('foreign', '456', False),
+                                                     (PROJECT, '', False)])
+def test_project_alias_is_resolved_from_authenticated_project_response(
+        monkeypatch, project_id, number, valid):
+    from sky.adaptors import gcp  # pylint: disable=import-outside-toplevel
+    api = mock.Mock()
+    api.projects.return_value.get.return_value.execute.return_value = dict(
+        projectId=project_id, projectNumber=number)
+    monkeypatch.setattr(gcp, 'build', lambda *args, **kwargs: api)
+    if valid:
+        assert wait.canonical_parent(PROJECT,
+                                     ZONE) == f'projects/123/locations/{ZONE}'
+    else:
+        with pytest.raises(ValueError):
+            wait.canonical_parent(PROJECT, ZONE)

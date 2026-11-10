@@ -173,6 +173,10 @@ def validate_teardown(project: str, zone: str, cluster: str,
 def prepare(path: pathlib.Path, project: str, zone: str, cluster: str,
             expected: dict, bodies: dict) -> dict:
     """Commit the entire allocation group before sending any create RPC."""
+    try:
+        canonical = canonical_parent(project, zone)
+    except Exception:  # pylint: disable=broad-except
+        pause(path, 'TPU project identity unavailable; no create sent')
     value = dict(version=1,
                  stage='creating',
                  request_id=common_utils.get_current_request_id(),
@@ -182,7 +186,9 @@ def prepare(path: pathlib.Path, project: str, zone: str, cluster: str,
                  contract=copy.deepcopy(expected),
                  queue_deadline=time.time() + QUEUE_TIMEOUT,
                  resources={
-                     name: dict(body=body, phase='prepared')
+                     name: dict(body=body,
+                                phase='prepared',
+                                canonical_parent=canonical)
                      for name, body in bodies.items()
                  })
     save(path, value)
@@ -192,6 +198,20 @@ def prepare(path: pathlib.Path, project: str, zone: str, cluster: str,
 def _specs(body: dict) -> list:
     specs = body['tpu']['nodeSpec']
     return [specs] if isinstance(specs, dict) else specs
+
+
+def canonical_parent(project: str, zone: str) -> str:
+    """Resolve Google's numeric parent using an authenticated project read."""
+    resource = gcp.build('cloudresourcemanager',
+                         'v1',
+                         credentials=None,
+                         cache_discovery=False).projects().get(
+                             projectId=project).execute(num_retries=2)
+    number = str(resource.get('projectNumber', ''))
+    if not number.isdigit() or project not in (resource.get('projectId'),
+                                               number):
+        raise ValueError('GCP project identity is not verified')
+    return f'projects/{number}/locations/{zone}'
 
 
 def _validate(resource: dict, name: str, row: dict) -> None:
@@ -208,9 +228,14 @@ def _validate(resource: dict, name: str, row: dict) -> None:
     if len(actual_specs) != len(expected_specs):
         raise ValueError('allocation group changed')
     for actual, desired in zip(actual_specs, expected_specs):
+        parents = {desired['parent']}
+        if row.get('canonical_parent'):
+            parents.add(row['canonical_parent'])
+        if actual.get('parent') not in parents:
+            raise ValueError('TPU parent identity changed')
         if any(
                 actual.get(key) != desired.get(key)
-                for key in ('parent', 'nodeId', 'multiNodeParams')):
+                for key in ('nodeId', 'multiNodeParams')):
             raise ValueError('TPU node identity changed')
         node, desired_node = actual.get('node', {}), desired['node']
         for key in ('acceleratorType', 'runtimeVersion', 'labels'):
