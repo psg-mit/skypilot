@@ -7,12 +7,15 @@ leader-aware routing.
 # underscore is the standard convention for fixtures injected for side
 # effects). Disable for the file.
 # pylint: disable=invalid-name,protected-access
+from types import SimpleNamespace
+
 import pytest
 import sqlalchemy
 from sqlalchemy import create_engine
 from sqlalchemy import orm
 
 from sky.serve import serve_state
+from sky.server.requests import requests as api_requests
 
 
 def _read_row(engine, name):
@@ -40,7 +43,10 @@ def _mock_serve_db(tmp_path, monkeypatch):
     yield engine
 
 
-def _add_minimal_service(name: str, controller_ip=None, user_hash=None):
+def _add_minimal_service(name: str,
+                         controller_ip=None,
+                         user_hash=None,
+                         pool=False):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
     return serve_state.add_service(
@@ -51,12 +57,62 @@ def _add_minimal_service(name: str, controller_ip=None, user_hash=None):
         load_balancing_policy='round_robin',
         status=serve_state.ServiceStatus.CONTROLLER_INIT,
         tls_encrypted=False,
-        pool=False,
+        pool=pool,
         controller_pid=12345,
         entrypoint='entry',
         controller_ip=controller_ip,
         user_hash=user_hash,
     )
+
+
+@pytest.mark.parametrize('change', [
+    None, 'running', 'pending', 'pid', 'owner', 'purpose', 'managed', 'missing',
+    'mixed', 'unknown_owner', 'non_pool', 'api_error'
+])
+def test_parked_launch_admission_requires_owned_idle_api_requests(
+        _mock_serve_db, monkeypatch, change):
+    owner = None if change == 'unknown_owner' else 'abcd1234'
+    _add_minimal_service('pool', user_hash=owner, pool=change != 'non_pool')
+    info = SimpleNamespace(status=serve_state.ReplicaStatus.PROVISIONING,
+                           cluster_name='pool-1')
+    serve_state.add_or_update_replica('pool', 1, info)
+    request = SimpleNamespace(status=api_requests.RequestStatus.WAITING,
+                              pid=None,
+                              user_id='abcd1234',
+                              cluster_name='pool-1',
+                              request_body=SimpleNamespace(
+                                  is_launched_by_sky_serve_controller=True,
+                                  is_launched_by_jobs_controller=False))
+    records = [request]
+    if change == 'running':
+        request.status = api_requests.RequestStatus.RUNNING
+    elif change == 'pending':
+        request.status = api_requests.RequestStatus.PENDING
+    elif change == 'pid':
+        request.pid = 123
+    elif change == 'owner':
+        request.user_id = 'foreign'
+    elif change == 'purpose':
+        request.request_body.is_launched_by_sky_serve_controller = False
+    elif change == 'managed':
+        request.request_body.is_launched_by_jobs_controller = True
+    elif change == 'missing':
+        records = []
+    elif change == 'mixed':
+        records.append(
+            SimpleNamespace(**dict(vars(request),
+                                   status=api_requests.RequestStatus.RUNNING)))
+
+    def read(filters):
+        assert filters.cluster_names == ['pool-1']
+        if change == 'api_error':
+            raise RuntimeError('Request backend unavailable')
+        return records
+
+    monkeypatch.setattr(serve_state.api_requests, 'get_request_tasks', read)
+    assert serve_state.total_number_provisioning_replicas() == 1
+    assert serve_state.total_number_provisioning_replicas(
+        exclude_parked=True) == (0 if change is None else 1)
 
 
 class TestAddServiceWritesControllerIp:
@@ -91,6 +147,7 @@ class TestAddServiceWritesControllerIp:
 
 
 class TestGetServiceFromNameReturnsControllerIp:
+    """Read back the persisted controller address."""
 
     def _add_with_version(self, service_name, controller_ip):
         # Reading via get_service_from_name requires a version_specs row

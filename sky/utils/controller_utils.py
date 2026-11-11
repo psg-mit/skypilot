@@ -52,9 +52,12 @@ if typing.TYPE_CHECKING:
 
     from sky import task as task_lib
     from sky.backends import cloud_vm_ray_backend
+    from sky.server.requests import restart_recovery
 else:
     from sky.adaptors import common as adaptors_common
     psutil = adaptors_common.LazyImport('psutil')
+    restart_recovery = adaptors_common.LazyImport(
+        'sky.server.requests.restart_recovery')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -1729,6 +1732,8 @@ def can_terminate(pool: bool) -> bool:
     # TODO(tian): probe API server to see if there is any pending terminate
     # requests.
     num_terminating = (
-        serve_state.total_number_provisioning_replicas() +
+        serve_state.total_number_provisioning_replicas(
+            exclude_parked=(pool and _is_consolidation_mode(pool) and
+                            restart_recovery.enabled())) +
         serve_state.total_number_terminating_replicas() / SERVE_LAUNCH_RATIO)
     return num_terminating < _get_request_parallelism(pool)

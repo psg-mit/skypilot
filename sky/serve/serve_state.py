@@ -15,6 +15,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext import declarative
 
+from sky import sky_logging
 from sky.serve import constants
 from sky.utils import common_utils
 from sky.utils.db import db_utils
@@ -25,6 +26,12 @@ if typing.TYPE_CHECKING:
 
     from sky.serve import replica_managers
     from sky.serve import service_spec
+    from sky.server.requests import requests as api_requests
+else:
+    from sky.adaptors import common as adaptors_common
+    api_requests = adaptors_common.LazyImport('sky.server.requests.requests')
+
+logger = sky_logging.init_logger(__name__)
 
 Base = declarative.declarative_base()
 
@@ -709,18 +716,61 @@ def get_replica_infos(
     return [pickle.loads(row[0]) for row in rows]
 
 
-def total_number_provisioning_replicas() -> int:
-    """Returns the total number of provisioning replicas."""
+def total_number_provisioning_replicas(exclude_parked: bool = False) -> int:
+    """Count launch admission demand, retaining unknown request ownership."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        rows = session.execute(sqlalchemy.select(
-            replicas_table.c.replica_info)).fetchall()
-    provisioning_count = 0
+        rows = session.execute(
+            sqlalchemy.select(replicas_table.c.replica_info,
+                              services_table.c.user_hash,
+                              services_table.c.pool).select_from(
+                                  replicas_table.outerjoin(
+                                      services_table,
+                                      replicas_table.c.service_name ==
+                                      services_table.c.name))).fetchall()
+    provisioning = []
     for row in rows:
         replica_info: 'replica_managers.ReplicaInfo' = pickle.loads(row[0])
         if replica_info.status == ReplicaStatus.PROVISIONING:
-            provisioning_count += 1
-    return provisioning_count
+            provisioning.append((replica_info, row[1], row[2]))
+    if not exclude_parked:
+        return len(provisioning)
+    names = collections.Counter(
+        info.cluster_name for info, _, _ in provisioning)
+    owners = {
+        info.cluster_name: owner
+        for info, owner, pool in provisioning
+        if pool and owner and names[info.cluster_name] == 1
+    }
+    if not owners:
+        return len(provisioning)
+    try:
+        requests = api_requests.get_request_tasks(
+            api_requests.RequestTaskFilter(
+                cluster_names=list(owners),
+                include_request_names=['sky.launch'],
+                status=api_requests.RequestStatus.active_statuses()))
+        by_cluster = collections.defaultdict(list)
+        for request in requests:
+            by_cluster[request.cluster_name].append(request)
+        parked = {
+            name for name, owner in owners.items() if by_cluster[name] and all(
+                request.status == api_requests.RequestStatus.WAITING and
+                request.pid is None and request.user_id == owner and
+                request.cluster_name == name and
+                getattr(request.request_body,
+                        'is_launched_by_sky_serve_controller', False) and
+                not getattr(request.request_body,
+                            'is_launched_by_jobs_controller', False)
+                for request in by_cluster[name])
+        }
+    except Exception as error:  # pylint: disable=broad-except
+        logger.warning(
+            'Pool launch admission unavailable; retaining all '
+            'provisioning slots: %s',
+            type(error).__name__)
+        return len(provisioning)
+    return len(provisioning) - len(parked)
 
 
 def total_number_terminating_replicas() -> int:
