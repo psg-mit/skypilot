@@ -68,6 +68,8 @@ from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
 
+pool_recovery = adaptors_common.LazyImport('sky.serve.pool_recovery')
+
 if typing.TYPE_CHECKING:
     import base64
     import binascii
@@ -1077,6 +1079,10 @@ def _launch(
         extra_launch_context=_extra_launch_context or {},
         include_credentials=include_credentials,
     )
+    original_request = pool_recovery.find_existing_launch(body)
+    if original_request is not None:
+        logger.info('Reconnecting pool worker to request %s', original_request)
+        return original_request
     response = server_common.make_authenticated_request(
         'POST', '/launch', json=json.loads(body.model_dump_json()), timeout=5)
     return server_common.get_request_id(response)

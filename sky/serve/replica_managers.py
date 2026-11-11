@@ -23,6 +23,7 @@ from sky import task as task_lib
 from sky.backends import backend_utils
 from sky.client import sdk
 from sky.serve import constants as serve_constants
+from sky.serve import pool_recovery
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service
@@ -174,6 +175,12 @@ def launch_cluster(replica_id: int,
             replica_to_request_id[replica_id] = request_id
             sdk.stream_and_get(request_id)
             logger.info(f'Replica cluster {cluster_name} launched.')
+        except pool_recovery.PoolLaunchRecoveryError as e:
+            # A mismatch is not a failed provisioning attempt. Keep every
+            # existing request/allocation intact; never enter cleanup/replay.
+            logger.warning('Pool worker recovery paused: %s', e)
+            time.sleep(_RETRY_INIT_GAP_SECONDS)
+            continue
         except (exceptions.InvalidClusterNameError,
                 exceptions.NoCloudAccessError,
                 exceptions.ResourcesMismatchError) as e:
