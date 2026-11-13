@@ -233,3 +233,31 @@ def test_completed_down_with_scheduled_record_is_collected(thread_pool_manager):
     assert not manager._down_thread_pool
     manager._handle_sky_down_finish.assert_called_once_with(info,
                                                             format_exc=None)
+
+
+@pytest.mark.parametrize('disposition',
+                         ['scale_down', 'preempted', 'purged', 'old_version'])
+def test_failed_teardown_retains_worker_identity(monkeypatch, disposition):
+    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'pool'
+    manager.latest_version = 2 if disposition == 'old_version' else 1
+    manager._last_termination_check = {1: 10}
+    info = replica_managers.ReplicaInfo(1, 'pool-1', '-', False, None, 1, None)
+    info.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+    info.status_property.is_scale_down = disposition in ('scale_down',
+                                                         'preempted')
+    info.status_property.preempted = disposition == 'preempted'
+    info.status_property.purged = disposition == 'purged'
+    save = mock.Mock()
+    remove = mock.Mock()
+    monkeypatch.setattr(replica_managers.serve_state, 'add_or_update_replica',
+                        save)
+    monkeypatch.setattr(replica_managers.serve_state, 'remove_replica', remove)
+
+    manager._handle_sky_down_finish(info, format_exc='provider teardown failed')
+    save.assert_called_once_with('pool', 1, info)
+    remove.assert_not_called()
+    assert info.cluster_name == 'pool-1'
+    assert (info.status_property.sky_down_status ==
+            common_utils.ProcessStatus.FAILED)

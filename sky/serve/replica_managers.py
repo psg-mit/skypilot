@@ -984,6 +984,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                          f'exited abnormally with exception {format_exc}.')
             info.status_property.sky_down_status = (
                 common_utils.ProcessStatus.FAILED)
+            # Scale-down, preemption and purge do not prove cloud teardown.
+            # Keep the exact worker available for reconciliation on failure.
+            serve_state.add_or_update_replica(self._service_name,
+                                              info.replica_id, info)
+            self._last_termination_check.pop(info.replica_id, None)
+            return
         else:
             info.status_property.sky_down_status = (
                 common_utils.ProcessStatus.SUCCEEDED)
