@@ -1291,8 +1291,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._service_name, replica_id)
                 assert info is not None, replica_id
                 error_in_sky_launch = False
-                if info.status == serve_state.ReplicaStatus.PENDING:
-                    # sky.launch not started yet
+                if t.ident is None:
+                    # Persisted replica status can lag/reset during recovery.
+                    # Only the thread itself proves it has never started; a
+                    # finished thread must be collected, never started again.
                     if controller_utils.can_provision(self._is_pool):
                         t.start()
                         info.status_property.sky_launch_status = (
@@ -1351,9 +1353,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             info = serve_state.get_replica_info_from_id(self._service_name,
                                                         replica_id)
             assert info is not None, replica_id
-            if (info.status_property.sky_down_status ==
-                    common_utils.ProcessStatus.SCHEDULED):
-                # sky.down not started yet
+            if t.ident is None:
+                # As for launches, a stale SCHEDULED record does not mean a
+                # completed termination thread can be started a second time.
                 if controller_utils.can_terminate(self._is_pool):
                     t.start()
                     info.status_property.sky_down_status = (

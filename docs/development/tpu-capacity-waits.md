@@ -37,6 +37,13 @@ requests and uploads: the old version's normal shutdown cancels API requests,
 and its startup erases the local request database. Rollback therefore requires
 the preserved state and an explicit reconciliation of every outstanding intent.
 
+Pool operation threads use their actual start identity, rather than the persisted
+replica status, to distinguish admission waits from completed operations. A
+recovered or delayed status write must not restart a completed thread or prevent
+the refresher from collecting peer operations. Terminal launch/teardown outcomes
+still follow the normal ownership and cleanup checks; a stale status never
+authorizes replaying a cloud request.
+
 ## Manual verification
 
 1. Run the GCP queued-resource and request executor/restart unit tests in an
@@ -52,3 +59,7 @@ the preserved state and an explicit reconciliation of every outstanding intent.
    readiness. Cancel a separate explicitly disposable test through its owning
    controller; verify it never resumes and native teardown removes its exact
    queued resources. Do not cancel existing experiments as a test.
+5. After pool recovery, observe several refresher cycles. Completed launch and
+   teardown operations must leave their thread pools even when their saved
+   replica status was stale. Verify no repeated thread-start errors, and match
+   each replacement to its original request or a safely retired prior generation.

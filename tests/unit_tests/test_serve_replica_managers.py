@@ -4,9 +4,16 @@ Currently focused on `SkyPilotReplicaManager.__init__` startup ordering:
 the daemon threads (especially `_job_status_fetcher`) must NOT race the
 main thread for `self.lock` before `_recover_replica_operations` runs.
 """
+# pylint: disable=protected-access,redefined-outer-name
+import contextlib
+import threading
 from unittest import mock
 
+import pytest
+
 from sky.serve import replica_managers
+from sky.utils import common_utils
+from sky.utils import thread_utils
 
 
 class TestSkyPilotReplicaManagerInitOrdering:
@@ -137,3 +144,92 @@ class TestSkyPilotReplicaManagerInitOrdering:
         assert '_thread_pool_refresher' in started_targets
         assert '_job_status_fetcher' in started_targets
         assert '_replica_prober' in started_targets
+
+
+@pytest.fixture
+def thread_pool_manager(monkeypatch):
+    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager.lock = threading.RLock()
+    manager._service_name = 'pool'
+    manager._is_pool = True
+    manager._spot_placer = None
+    manager.least_recent_version = 1
+    manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+    manager._down_thread_pool = thread_utils.ThreadSafeDict()
+    manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+    manager._terminate_replica = mock.Mock()
+    manager._handle_sky_down_finish = mock.Mock()
+    info = replica_managers.ReplicaInfo(1, 'pool-1', '-', False, None, 1, None)
+    monkeypatch.setattr(replica_managers.serve_state,
+                        'get_replica_info_from_id', lambda *_: info)
+    monkeypatch.setattr(replica_managers.serve_state, 'get_replica_infos',
+                        lambda *_: [info])
+    monkeypatch.setattr(replica_managers.serve_state, 'add_or_update_replica',
+                        mock.Mock())
+    monkeypatch.setattr(replica_managers.filelock, 'FileLock',
+                        lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(replica_managers.controller_utils, 'can_provision',
+                        lambda *_: True)
+    monkeypatch.setattr(replica_managers.controller_utils, 'can_terminate',
+                        lambda *_: True)
+    return manager, info
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_completed_launch_with_pending_record_is_collected(
+        thread_pool_manager, failed):
+    manager, info = thread_pool_manager
+
+    def launch():
+        if failed:
+            raise RuntimeError('launch failed')
+
+    thread = thread_utils.SafeThread(target=launch)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    manager._launch_thread_pool[1] = thread
+    manager._replica_to_request_id[1] = 'original-request'
+    # Simulate a persisted status reset while the launch thread was running.
+    assert info.status == replica_managers.serve_state.ReplicaStatus.PENDING
+    manager._refresh_thread_pool()
+    manager._refresh_thread_pool()
+
+    assert not manager._launch_thread_pool
+    assert not manager._replica_to_request_id
+    expected = (common_utils.ProcessStatus.FAILED
+                if failed else common_utils.ProcessStatus.SUCCEEDED)
+    assert info.status_property.sky_launch_status == expected
+    assert manager._terminate_replica.call_count == int(failed)
+
+
+def test_unstarted_launch_with_provisioning_record_starts_once(
+        thread_pool_manager):
+    manager, info = thread_pool_manager
+    launched = mock.Mock()
+    thread = thread_utils.SafeThread(target=launched)
+    manager._launch_thread_pool[1] = thread
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.RUNNING
+
+    manager._refresh_thread_pool()
+    thread.join(timeout=5)
+    manager._refresh_thread_pool()
+    launched.assert_called_once_with()
+    assert not manager._launch_thread_pool
+    assert (info.status_property.sky_launch_status ==
+            common_utils.ProcessStatus.SUCCEEDED)
+
+
+def test_completed_down_with_scheduled_record_is_collected(thread_pool_manager):
+    manager, info = thread_pool_manager
+    thread = thread_utils.SafeThread(target=lambda: None)
+    thread.start()
+    thread.join(timeout=5)
+    manager._down_thread_pool[1] = thread
+    info.status_property.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+
+    manager._refresh_thread_pool()
+    manager._refresh_thread_pool()
+    assert not manager._down_thread_pool
+    manager._handle_sky_down_finish.assert_called_once_with(info,
+                                                            format_exc=None)
