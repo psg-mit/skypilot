@@ -1212,6 +1212,9 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _retire_alias_locked(self, intent: pool_alias.AliasRetirement) -> dict:
         if not self._is_pool:
             raise ValueError('Alias retirement requires a persistent pool')
+        completed = pool_alias.committed_receipt(self._service_name, intent)
+        if completed is not None:
+            return completed
         for replica_id in (intent.alias_id, intent.keeper_id):
             if (replica_id in self._launch_thread_pool or
                     replica_id in self._down_thread_pool):

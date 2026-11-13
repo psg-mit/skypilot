@@ -77,7 +77,11 @@ No provider lifecycle RPC or request cancellation is part of this action.
 
 Back up retirement receipts with the native databases and capacity journals.
 A lost reply is retried with the identical binding; a completed receipt is
-returned without replaying changes or disturbing later jobs. Controller startup
+returned without replaying changes or disturbing later jobs.
+Receipt reconciliation precedes worker-operation checks and cluster locks; it
+does not clear newer controller bookkeeping or block on subsequent launches,
+teardowns, API operations or pool versions under the same owner/incarnation.
+Controller startup
 can finish a prepared intent after rechecking its fences. Changed ownership,
 active jobs, or unavailable evidence retains quarantine for reconciliation.
 Committed and prepared receipts both advance the replica ID high-water mark.

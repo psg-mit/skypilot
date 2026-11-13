@@ -314,6 +314,54 @@ def test_lost_receipt_replay_does_not_touch_new_jobs_on_keeper(case):
             dataclasses.replace(case.intent, reason='changed'))
 
 
+def test_identical_manager_retry_after_map_cleanup_is_idempotent(case):
+    case.manager._replica_to_request_id[28] = 'original-launch'
+    case.manager._replica_to_launch_cancelled[28] = False
+    first = case.manager.retire_replica_alias(case.intent)
+    assert case.manager._replica_to_request_id.get(28) is None
+    assert case.manager._replica_to_launch_cancelled.get(28) is None
+    assert case.manager.retire_replica_alias(case.intent) == first
+
+
+@pytest.mark.parametrize('subsequent',
+                         ['launch', 'down', 'api', 'job', 'version'])
+def test_committed_manager_retry_never_touches_subsequent_work(
+        case, subsequent, monkeypatch):
+    first = case.manager.retire_replica_alias(case.intent)
+    if subsequent in ('launch', 'down'):
+        getattr(case.manager,
+                '_' + subsequent + '_thread_pool')[23] = mock.Mock()
+    elif subsequent == 'api':
+        case.active.append(mock.Mock())
+    elif subsequent == 'job':
+        case.jobs.append(2400)
+    else:
+        case.service['current_version'] = 2
+    case.manager._replica_to_request_id[28] = 'subsequent-request'
+    case.manager._replica_to_launch_cancelled[28] = False
+    native_locks = mock.Mock(
+        side_effect=AssertionError('Must not lock new work'))
+    monkeypatch.setattr(replica_managers.locks, 'get_lock', native_locks)
+    provider_calls = list(case.api.mock_calls)
+    before = pickle.dumps(
+        (case.infos, case.clusters, case.launches, case.attempts))
+    assert case.manager.retire_replica_alias(case.intent) == first
+    assert not native_locks.called
+    assert case.api.mock_calls == provider_calls
+    assert pickle.dumps(
+        (case.infos, case.clusters, case.launches, case.attempts)) == before
+    assert case.manager._replica_to_request_id[28] == 'subsequent-request'
+    assert case.manager._replica_to_launch_cancelled[28] is False
+
+
+@pytest.mark.parametrize('field', ['hash', 'user_hash'])
+def test_committed_receipt_still_rejects_another_pool_or_owner(case, field):
+    case.manager.retire_replica_alias(case.intent)
+    case.service[field] = 'changed'
+    with pytest.raises(ValueError, match='incarnation'):
+        case.manager.retire_replica_alias(case.intent)
+
+
 @pytest.mark.parametrize('fail_at',
                          ['cluster_remove', 'replica_remove', 'commit'])
 def test_partial_operation_stays_quarantined_and_resumes(

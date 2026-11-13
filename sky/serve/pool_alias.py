@@ -9,7 +9,7 @@ import hashlib
 import json
 import pathlib
 import pickle
-from typing import List
+from typing import List, Optional
 
 from sky import global_user_state
 from sky.adaptors import common as adaptors_common
@@ -97,14 +97,34 @@ def pending_intents(service_name: str) -> List[AliasRetirement]:
     ]
 
 
-def _service_fence(service_name: str, intent: AliasRetirement) -> None:
+def _service_fence(service_name: str,
+                   intent: AliasRetirement,
+                   check_version: bool = True) -> None:
     service = serve_state.get_service_from_name(service_name)
     if (service is None or not service['pool'] or
             service['hash'] != intent.pool_hash or
             service['user_hash'] != intent.owner or
             common_utils.get_user_hash() != intent.owner or
-            service['current_version'] != intent.version):
+        (check_version and service['current_version'] != intent.version)):
         raise ValueError('Pool owner, version or incarnation changed')
+
+
+def committed_receipt(service_name: str,
+                      intent: AliasRetirement) -> Optional[dict]:
+    """Read an identical completed receipt without touching later work."""
+    path = _path(intent)
+    if not path.exists():
+        return None
+    receipt = json.loads(path.read_text())
+    if (receipt['service_name'] != service_name or
+            receipt['intent'] != dataclasses.asdict(intent)):
+        raise ValueError('Retirement intent changed')
+    if receipt['stage'] != 'committed':
+        return None
+    # A later pool update is unrelated to this historical receipt. Keep the
+    # exact pool incarnation and owner fences, but do not lock/query workers.
+    _service_fence(service_name, intent, check_version=False)
+    return receipt
 
 
 def _request_fence(name: str, request_id: str, cluster_hash: str,
@@ -213,6 +233,9 @@ def _provider_fence(intent: AliasRetirement) -> None:
 
 def retire(service_name: str, intent: AliasRetirement) -> dict:
     """Caller holds controller, scheduling, cluster and allocation locks."""
+    completed = committed_receipt(service_name, intent)
+    if completed is not None:
+        return completed
     _service_fence(service_name, intent)
     path = _path(intent)
     receipt = json.loads(path.read_text()) if path.exists() else {}
