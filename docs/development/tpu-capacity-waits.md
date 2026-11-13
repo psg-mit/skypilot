@@ -48,6 +48,47 @@ Controller recovery also advances the next worker ID past every retained
 replica, including failed and terminating workers. A replacement must not
 overwrite their records or collide with an original operation still in flight.
 
+## Duplicate pool bindings
+
+The cloud-label allocation lock serializes new queued TPU creates with native
+teardown. READY journals continue to own their native incarnation; another
+incarnation parks with its original API request, without failover or cleanup.
+Existing nodes require the exact durable allocation receipt. New GCP names use
+a longer truncated-name hash; retained handles and YAMLs keep their old names.
+Hash length is not an ownership proof.
+
+Do not use down/purge to remove a logical alias of a live TPU. The internal
+native controller action `POST /controller/retire_replica_alias` accepts the
+complete `sky.serve.pool_alias.AliasRetirement` binding. It checks the pool
+hash, owner, workspace, version, both native cluster generations, original
+successful launches and equivalent immutable inputs, original queue journal,
+and exact ACTIVE queue/READY node identities and creation times. It requires
+zero nonterminal pool jobs, active worker API requests, or outstanding launch
+or teardown threads. Operators must separately verify current all-guest
+identity and idleness before invoking this administrative action.
+
+The controller holds its probe lock, pool scheduling lock, both native cluster
+locks, and allocation lock. It first commits a private retirement intent in
+`~/.sky/serve/alias_retirements/`. That intent quarantines the alias from job
+selection and reserves its replica ID. It archives the exact alias record and
+removes only the active logical alias registration. Original launch requests,
+attempts/history, worker inputs, keeper journal, and provider allocations remain.
+No provider lifecycle RPC or request cancellation is part of this action.
+
+Back up retirement receipts with the native databases and capacity journals.
+A lost reply is retried with the identical binding; a completed receipt is
+returned without replaying changes or disturbing later jobs. Controller startup
+can finish a prepared intent after rechecking its fences. Changed ownership,
+active jobs, or unavailable evidence retains quarantine for reconciliation.
+Committed and prepared receipts both advance the replica ID high-water mark.
+
+Keep pool dispatch held through a reviewed rollout and fresh guest audit.
+After retirement, verify distinct physical allocations, unchanged provider
+generations and guest boots, preserved requests/history, and unrelated jobs.
+Do not roll back to code that ignores retirement intents while a prepared
+intent remains or an old alias can be resurrected. Prefer completing the same
+forward repair; restoring a duplicate active row is not a safe rollback.
+
 ## Manual verification
 
 1. Run the GCP queued-resource and request executor/restart unit tests in an

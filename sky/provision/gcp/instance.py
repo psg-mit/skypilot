@@ -177,6 +177,7 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
     labels = dict(sorted(copy.deepcopy(labels).items()))
     resumed_instance_ids: List[str] = []
     created_instance_ids: List[str] = []
+    journal = None
 
     node_type = instance_utils.get_node_type(config.node_config)
     project_id = config.provider_config['project_id']
@@ -234,6 +235,8 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
         status_filters=None,
     )
     exist_instances = list(exist_instances.values())
+    if journal is not None:
+        queued_resource_wait.validate_existing_nodes(journal, exist_instances)
     head_instance_id = _get_head_instance_id(exist_instances)
 
     # NOTE: We are not handling REPAIRING, SUSPENDING, SUSPENDED status.
@@ -404,6 +407,12 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
     """See sky/provision/__init__.py"""
     del cluster_name  # unused
     try:
+        if config.node_config.get('gcp_queued_resource'):
+            with queued_resource_wait.allocation_lock(
+                    config.provider_config['project_id'],
+                    config.provider_config['availability_zone'],
+                    cluster_name_on_cloud):
+                return _run_instances(region, cluster_name_on_cloud, config)
         return _run_instances(region, cluster_name_on_cloud, config)
     except gcp.http_error_exception() as e:
         error_details = getattr(e, 'error_details')
@@ -569,6 +578,24 @@ def terminate_instances(
     cluster_name_on_cloud: str,
     provider_config: Optional[Dict[str, Any]] = None,
     worker_only: bool = False,
+) -> None:
+    """Serialize TPU teardown against competing label-bound launches."""
+    assert provider_config is not None, cluster_name_on_cloud
+    if provider_config.get('_has_tpus', False):
+        with queued_resource_wait.allocation_lock(
+                provider_config['project_id'],
+                provider_config['availability_zone'], cluster_name_on_cloud):
+            _terminate_instances(cluster_name_on_cloud, provider_config,
+                                 worker_only)
+    else:
+        _terminate_instances(cluster_name_on_cloud, provider_config,
+                             worker_only)
+
+
+def _terminate_instances(
+    cluster_name_on_cloud: str,
+    provider_config: Dict[str, Any],
+    worker_only: bool,
 ) -> None:
     """See sky/provision/__init__.py"""
     assert provider_config is not None, cluster_name_on_cloud

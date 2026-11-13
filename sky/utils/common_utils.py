@@ -260,9 +260,11 @@ def check_workspace_name_is_valid(workspace_name: Optional[str]) -> None:
                 'lowercase letters, numbers, dashes, and underscores.')
 
 
-def make_cluster_name_on_cloud(display_name: str,
-                               max_length: Optional[int] = 15,
-                               add_user_hash: bool = True) -> str:
+def make_cluster_name_on_cloud(
+        display_name: str,
+        max_length: Optional[int] = 15,
+        add_user_hash: bool = True,
+        name_hash_length: int = CLUSTER_NAME_HASH_LENGTH) -> str:
     """Generate valid cluster name on cloud that is unique to the user.
 
     This is to map the cluster name to a valid length and character set for
@@ -281,6 +283,7 @@ def make_cluster_name_on_cloud(display_name: str,
         max_length: The maximum length of the cluster name. If None, no
             truncation is performed.
         add_user_hash: Whether to append user hash to the cluster name.
+        name_hash_length: Truncated-name hash length for newly named resources.
     """
 
     cluster_name_on_cloud = re.sub(r'[._]', '-', display_name).lower()
@@ -298,7 +301,7 @@ def make_cluster_name_on_cloud(display_name: str,
             len(cluster_name_on_cloud) <= max_length - user_hash_length):
         return f'{cluster_name_on_cloud}{user_hash}'
     # -1 is for the dash between cluster name and cluster name hash.
-    truncate_cluster_name_length = (max_length - CLUSTER_NAME_HASH_LENGTH - 1 -
+    truncate_cluster_name_length = (max_length - name_hash_length - 1 -
                                     user_hash_length)
     truncate_cluster_name = cluster_name_on_cloud[:truncate_cluster_name_length]
     if truncate_cluster_name.endswith('-'):
@@ -310,7 +313,7 @@ def make_cluster_name_on_cloud(display_name: str,
     # Use base36 to reduce the length of the hash.
     display_name_hash = base36_encode(display_name_hash)
     return (f'{truncate_cluster_name}'
-            f'-{display_name_hash[:CLUSTER_NAME_HASH_LENGTH]}{user_hash}')
+            f'-{display_name_hash[:name_hash_length]}{user_hash}')
 
 
 def cluster_name_in_hint(cluster_name: str, cluster_name_on_cloud: str) -> str:

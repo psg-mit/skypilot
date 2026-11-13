@@ -5,6 +5,7 @@ import asyncio
 import copy
 import json
 import pickle
+import threading
 from unittest import mock
 
 from googleapiclient import errors
@@ -230,6 +231,104 @@ def test_another_request_cannot_adopt_wait_or_change_contract(
     with pytest.raises(exceptions.ExecutionPausedError):
         _create(2)
     assert api.create.call_count == 1
+
+
+def test_ready_collision_parks_without_reusing_or_deleting_keeper(
+        queue, monkeypatch):
+    api, resources = queue
+    with pytest.raises(exceptions.ExecutionPausedError):
+        _create()
+    for resource in resources.values():
+        resource['state']['state'] = 'ACTIVE'
+    wait.create(_path())
+    original = _path().read_bytes()
+    monkeypatch.setattr(common_utils, 'get_current_request_id', lambda: 'alias')
+    monkeypatch.setattr(wait, 'native_cluster_hash', lambda: 'alias-generation')
+    node_filter = mock.Mock()
+    monkeypatch.setattr(instance_utils.GCPTPUVMInstance, 'filter', node_filter)
+    config = common.ProvisionConfig(provider_config=dict(
+        project_id=PROJECT, availability_zone=ZONE),
+                                    authentication_config={},
+                                    docker_config={},
+                                    node_config=CONFIG,
+                                    count=1,
+                                    tags={},
+                                    resume_stopped_nodes=True,
+                                    ports_to_open_on_launch=None)
+    with pytest.raises(exceptions.ExecutionPausedError, match='incarnation'):
+        instance.run_instances('us-central2', 'alias', CLUSTER, config)
+    assert not node_filter.called
+    with pytest.raises(common.ProvisionerError, match='ownership mismatch'):
+        wait.validate_teardown(PROJECT, ZONE, CLUSTER, resources)
+    assert _path().read_bytes() == original
+    assert api.create.call_count == 1
+    assert not api.delete.called
+
+
+def test_same_ready_incarnation_reuses_original_receipt(queue, monkeypatch):
+    _, resources = queue
+    with pytest.raises(exceptions.ExecutionPausedError):
+        _create()
+    for resource in resources.values():
+        resource['state']['state'] = 'ACTIVE'
+    wait.create(_path())
+    monkeypatch.setattr(common_utils, 'get_current_request_id',
+                        lambda: 'update')
+    original = wait.load(_path())
+    assert wait.open_journal(PROJECT, ZONE, CLUSTER,
+                             original['contract']) == _path()
+    assert not wait.journal_path('update', PROJECT, ZONE, CLUSTER).exists()
+
+
+def test_existing_nodes_without_receipt_cannot_be_adopted(queue):
+    api, _ = queue
+    with pytest.raises(exceptions.ExecutionPausedError, match='no original'):
+        wait.validate_existing_nodes(_path(), [dict(name='existing-tpu')])
+    assert not api.create.called
+    assert not api.delete.called
+
+
+def test_cloud_binding_lock_serializes_different_request_ids(queue):
+    first = wait.allocation_lock(PROJECT, ZONE, CLUSTER)
+    second = wait.allocation_lock(PROJECT, ZONE, CLUSTER)
+    with first:
+        with pytest.raises(TimeoutError):
+            second.acquire(timeout=0)
+
+
+def test_concurrent_colliding_launches_create_only_one_original(
+        queue, monkeypatch):
+    api, _ = queue
+    monkeypatch.setattr(common_utils, 'get_current_request_id',
+                        lambda: threading.current_thread().name)
+    monkeypatch.setattr(wait, 'native_cluster_hash',
+                        lambda: threading.current_thread().name)
+    monkeypatch.setattr(instance, '_run_instances', lambda *_: _create())
+    config = mock.Mock(node_config=CONFIG,
+                       provider_config=dict(project_id=PROJECT,
+                                            availability_zone=ZONE))
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def launch():
+        barrier.wait(timeout=5)
+        try:
+            instance.run_instances('region', 'native-name', CLUSTER, config)
+        except exceptions.ExecutionPausedError:
+            outcomes.append('parked')
+
+    threads = [
+        threading.Thread(target=launch, name=f'owner-{i}') for i in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert outcomes == ['parked', 'parked']
+    assert api.create.call_count == 1
+    assert len(list(wait.JOURNAL_ROOT.glob('*.json'))) == 1
+    assert not api.delete.called
 
 
 @pytest.mark.parametrize('node_count', [0, 1])

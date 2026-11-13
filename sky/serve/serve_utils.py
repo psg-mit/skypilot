@@ -31,6 +31,7 @@ from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.jobs import state as managed_job_state
 from sky.serve import constants
+from sky.serve import pool_alias
 from sky.serve import serve_state
 from sky.serve import spot_placer
 from sky.skylet import constants as skylet_constants
@@ -1066,9 +1067,11 @@ def load_version_string(payload: str) -> str:
 def get_ready_replicas(
         service_name: str) -> List['replica_managers.ReplicaInfo']:
     logger.info(f'Get number of replicas for pool {service_name!r}')
+    retired = set(pool_alias.retired_replica_ids(service_name))
     return [
         info for info in serve_state.get_replica_infos(service_name)
-        if info.status == serve_state.ReplicaStatus.READY
+        if (info.status == serve_state.ReplicaStatus.READY and
+            info.replica_id not in retired)
     ]
 
 

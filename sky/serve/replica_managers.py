@@ -1,4 +1,5 @@
 """ReplicaManager: handles the creation and deletion of endpoint replicas."""
+import contextlib
 import dataclasses
 import functools
 from multiprocessing import pool as mp_pool
@@ -23,6 +24,7 @@ from sky import task as task_lib
 from sky.backends import backend_utils
 from sky.client import sdk
 from sky.serve import constants as serve_constants
+from sky.serve import pool_alias
 from sky.serve import pool_recovery
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -35,6 +37,7 @@ from sky.utils import common_utils
 from sky.utils import context
 from sky.utils import controller_utils
 from sky.utils import env_options
+from sky.utils import locks
 from sky.utils import resources_utils
 from sky.utils import status_lib
 from sky.utils import thread_utils
@@ -802,6 +805,9 @@ class ReplicaManager:
         """Scale down replica with replica_id."""
         raise NotImplementedError
 
+    def retire_replica_alias(self, intent: pool_alias.AliasRetirement) -> dict:
+        raise NotImplementedError
+
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:
         raise NotImplementedError
@@ -882,13 +888,22 @@ class SkyPilotReplicaManager(ReplicaManager):
         assert (not self._launch_thread_pool and not self._down_thread_pool
                ), 'We should not have any running threads in a recovery run'
 
+        for intent in pool_alias.pending_intents(self._service_name):
+            try:
+                self._retire_alias_locked(intent)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning('Alias retirement remains quarantined: %s',
+                               error)
+
         # Retained failed and terminating workers still own their IDs. Starting
         # the counter at one after a controller restart can overwrite one of
         # those records while its original teardown is still in flight.
-        self._next_replica_id = max(
-            (info.replica_id
-             for info in serve_state.get_replica_infos(self._service_name)),
-            default=0) + 1
+        retained_ids = [
+            info.replica_id
+            for info in serve_state.get_replica_infos(self._service_name)
+        ]
+        retained_ids.extend(pool_alias.retired_replica_ids(self._service_name))
+        self._next_replica_id = max(retained_ids, default=0) + 1
 
         # There is a FIFO queue with capacity _MAX_NUM_LAUNCH for
         # _launch_replica.
@@ -1193,6 +1208,38 @@ class SkyPilotReplicaManager(ReplicaManager):
             replica_drain_delay_seconds=_DEFAULT_DRAIN_SECONDS,
             is_scale_down=True,
             purge=purge)
+
+    def _retire_alias_locked(self, intent: pool_alias.AliasRetirement) -> dict:
+        if not self._is_pool:
+            raise ValueError('Alias retirement requires a persistent pool')
+        for replica_id in (intent.alias_id, intent.keeper_id):
+            if (replica_id in self._launch_thread_pool or
+                    replica_id in self._down_thread_pool):
+                raise ValueError(
+                    'Worker has an outstanding controller operation')
+        # Scheduling takes the same pool lock. The manager lock already excludes
+        # probe/fetch/scale operations and stale probes writing the alias.
+        with filelock.FileLock(
+                serve_utils.get_service_filelock_path(
+                    self._service_name)), contextlib.ExitStack() as stack:
+            for replica_id in sorted((intent.alias_id, intent.keeper_id)):
+                name = f'{self._service_name}-{replica_id}'
+                stack.enter_context(
+                    locks.get_lock(backend_utils.cluster_status_lock_id(name)))
+            stack.enter_context(
+                pool_alias.queue.allocation_lock(intent.project, intent.zone,
+                                                 intent.cloud_name))
+            receipt = pool_alias.retire(self._service_name, intent)
+            self._replica_to_request_id.pop(intent.alias_id)
+            self._replica_to_launch_cancelled.pop(intent.alias_id)
+            self._last_termination_check.pop(intent.alias_id, None)
+            self._next_replica_id = max(self._next_replica_id,
+                                        intent.alias_id + 1)
+            return receipt
+
+    @with_lock
+    def retire_replica_alias(self, intent: pool_alias.AliasRetirement) -> dict:
+        return self._retire_alias_locked(intent)
 
     def _should_check_termination(self, info: ReplicaInfo) -> bool:
         """Whether a failed probe of a non-spot replica warrants a refresh.

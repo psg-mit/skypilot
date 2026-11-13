@@ -13,11 +13,13 @@ from typing import Any, Dict, List
 import colorama
 import fastapi
 from fastapi import responses
+from fastapi.concurrency import run_in_threadpool
 import uvicorn
 
 from sky import serve
 from sky import sky_logging
 from sky.serve import autoscalers
+from sky.serve import pool_alias
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -209,6 +211,24 @@ class SkyServeController:
                     'traceback': traceback.format_exc()
                 },
                                               status_code=500)
+
+        @self._app.post('/controller/retire_replica_alias')
+        async def retire_replica_alias(
+                request: fastapi.Request) -> fastapi.Response:
+            try:
+                intent = pool_alias.AliasRetirement(**(await request.json()))
+            except (TypeError, ValueError) as error:
+                return responses.JSONResponse(status_code=400,
+                                              content={'error': str(error)})
+            try:
+                receipt = await run_in_threadpool(
+                    self._replica_manager.retire_replica_alias, intent)
+                return responses.JSONResponse(content=receipt)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning('Alias retirement refused or incomplete: %s',
+                               error)
+                return responses.JSONResponse(status_code=409,
+                                              content={'error': str(error)})
 
         @self._app.post('/controller/terminate_replica')
         async def terminate_replica(

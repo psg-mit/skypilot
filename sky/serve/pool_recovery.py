@@ -5,6 +5,7 @@ from sky import global_user_state
 from sky.adaptors import common as adaptors_common
 from sky.jobs import utils as managed_job_utils
 from sky.provision.gcp import queued_resource_wait
+from sky.serve import constants as serve_constants
 from sky.serve import serve_state
 from sky.server.requests import payloads
 from sky.server.requests import restart_recovery
@@ -36,6 +37,21 @@ def _binding(body: payloads.LaunchBody):
                 'SKYPILOT_POD_MEMORY_GB_LIMIT'):
         value['env_vars'].pop(key, None)
     return value
+
+
+def equivalent_worker_launches(first: payloads.LaunchBody,
+                               second: payloads.LaunchBody) -> bool:
+    """Compare immutable inputs, allowing native names and replica env IDs."""
+    bindings = [_binding(first), _binding(second)]
+    for binding in bindings:
+        binding.pop('cluster_name', None)
+        for task in binding['task']:
+            # This duplicates the original YAML for display; the parsed task
+            # below retains its effective source, setup, resources and envs.
+            task.pop('_user_specified_yaml', None)
+            (task.get('envs') or {}).pop(serve_constants.REPLICA_ID_ENV_VAR,
+                                         None)
+    return bindings[0] == bindings[1]
 
 
 def _find_existing_launch(body: payloads.LaunchBody) -> Optional[str]:

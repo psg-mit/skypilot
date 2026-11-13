@@ -748,6 +748,27 @@ def _reject_not_ready_volume(volume_name: str, record: Dict[str, Any],
         f'or {remove_hint}.')
 
 
+def _cluster_name_on_cloud(cluster_name: str, cloud: clouds.Cloud) -> str:
+    """Preserve retained names; give genuinely new GCP clusters longer hashes."""
+    if not isinstance(cloud, clouds.GCP):
+        return common_utils.make_cluster_name_on_cloud(
+            cluster_name, max_length=cloud.max_cluster_name_length())
+    handle = global_user_state.get_handle_from_cluster_name(cluster_name)
+    if handle is not None and getattr(handle, 'cluster_name_on_cloud', None):
+        return handle.cluster_name_on_cloud
+    # A retained YAML can outlive its active handle. Do not reinterpret an
+    # accepted legacy launch merely because the name generator was upgraded.
+    old_yaml = global_user_state.get_cluster_yaml_str(
+        _get_yaml_path_from_cluster_name(cluster_name))
+    old = yaml_utils.safe_load(old_yaml) if old_yaml else {}
+    if old.get('cluster_name'):
+        return old['cluster_name']
+    return common_utils.make_cluster_name_on_cloud(
+        cluster_name,
+        max_length=cloud.max_cluster_name_length(),
+        name_hash_length=8)
+
+
 # TODO: too many things happening here - leaky abstraction. Refactor.
 @timeline.event
 def write_cluster_config(
@@ -793,8 +814,7 @@ def write_cluster_config(
     cloud = to_provision.cloud
     assert cloud is not None, to_provision
 
-    cluster_name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        cluster_name, max_length=cloud.max_cluster_name_length())
+    cluster_name_on_cloud = _cluster_name_on_cloud(cluster_name, cloud)
 
     # This can raise a ResourcesUnavailableError when:
     #  * The region/zones requested does not appear in the catalog. It can be

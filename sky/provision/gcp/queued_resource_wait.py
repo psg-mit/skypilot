@@ -72,20 +72,49 @@ def contract(config: dict, labels: dict, count: int) -> dict:
     return dict(config=config, labels=labels, count=count)
 
 
+def allocation_lock(project: str, zone: str, cluster: str) -> filelock.FileLock:
+    """Serialize label ownership, including the first durable create intent."""
+    root = JOURNAL_ROOT.expanduser() / 'bindings'
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key = hashlib.sha256(json.dumps([project, zone,
+                                     cluster]).encode()).hexdigest()
+    return filelock.FileLock(str(root / f'{key}.lock'))
+
+
+def matching_journals(project: str, zone: str, cluster: str):
+    """Read original allocation ownership without changing any journal."""
+    for path in JOURNAL_ROOT.expanduser().glob('*.json'):
+        value = load(path)
+        if ((value['project'], value['zone'], value['cluster'])
+                == (project, zone, cluster) and
+                value.get('stage') != 'retired'):
+            yield path, value
+
+
 def open_journal(project: str, zone: str, cluster: str,
                  expected: dict) -> Optional[pathlib.Path]:
     if not common_utils.is_in_request_context():
         return None
     path = journal_path(common_utils.get_current_request_id(), project, zone,
                         cluster)
-    for other in JOURNAL_ROOT.expanduser().glob('*.json'):
-        if other == path:
-            continue
-        value = load(other)
-        if ((value['project'], value['zone'], value['cluster'])
-                == (project, zone, cluster) and
-                value.get('stage') in ('creating', 'waiting')):
+    try:
+        current_hash = native_cluster_hash()
+    except Exception:  # pylint: disable=broad-except
+        pause(path, 'Native TPU identity unavailable; retaining allocation')
+    reusable = None
+    for other, value in matching_journals(project, zone, cluster):
+        if (not current_hash or
+                value.get('native_cluster_hash') != current_hash):
+            # In particular, READY is still owned. Reusing a cloud label is
+            # not authority to attach a different native cluster incarnation.
+            pause(path, 'Another native TPU incarnation owns this cloud name')
+        if other != path and (value.get('stage') != 'ready' or
+                              value.get('contract') != expected):
             pause(path, 'Another original TPU request owns this capacity wait')
+        if other != path:
+            reusable = other
+    if not path.exists() and reusable is not None:
+        return reusable
     if path.exists():
         try:
             value = load(path)
@@ -121,6 +150,23 @@ def open_journal(project: str, zone: str, cluster: str,
     return path
 
 
+def validate_existing_nodes(path: pathlib.Path, nodes: list) -> None:
+    """Existing nodes need a durable, generation-bound allocation receipt."""
+    if not nodes:
+        return
+    if not path.exists():
+        pause(path, 'Existing TPU nodes have no original allocation journal')
+    value = load(path)
+    expected = {
+        spec['nodeId']
+        for row in value['resources'].values()
+        for spec in _specs(row['body'])
+    }
+    if (value.get('native_cluster_hash') != native_cluster_hash() or any(
+            node['name'].rsplit('/', 1)[-1] not in expected for node in nodes)):
+        pause(path, 'Existing TPU nodes belong to another allocation')
+
+
 def retire(project: str, zone: str, cluster: str) -> None:
     """Called only after native teardown verified the entire queue is absent."""
     for path in JOURNAL_ROOT.expanduser().glob('*.json'):
@@ -148,11 +194,17 @@ def retire(project: str, zone: str, cluster: str) -> None:
 def validate_teardown(project: str, zone: str, cluster: str,
                       resources: dict) -> None:
     """Fence known generations and uncertain creates before native deletion."""
+    current_hash = native_cluster_hash()
     for path in JOURNAL_ROOT.expanduser().glob('*.json'):
         value = load(path)
         if ((value['project'], value['zone'], value['cluster']) !=
             (project, zone, cluster) or value.get('stage') == 'retired'):
             continue
+        if (not current_hash or
+                value.get('native_cluster_hash') != current_hash):
+            raise common.ProvisionerError(
+                'TPU teardown ownership mismatch; retaining original allocation'
+            )
         for name, row in value['resources'].items():
             if name in resources:
                 try:
@@ -201,6 +253,8 @@ def prepare(path: pathlib.Path, project: str, zone: str, cluster: str,
 
 def native_cluster_hash() -> Optional[str]:
     """Authoritative generation for completed-launch controller reattachment."""
+    if not common_utils.is_in_request_context():
+        return None
     # These imports would form a requests/provision initialization cycle.
     # pylint: disable=import-outside-toplevel
     from sky import global_user_state

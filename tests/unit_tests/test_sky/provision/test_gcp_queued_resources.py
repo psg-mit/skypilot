@@ -12,6 +12,7 @@ from sky.provision import common
 from sky.provision import constants as provision_constants
 from sky.provision.gcp import instance
 from sky.provision.gcp import instance_utils
+from sky.provision.gcp import queued_resource_wait
 from sky.utils import status_lib
 
 PROJECT = 'test-project'
@@ -24,6 +25,12 @@ PROVIDER_CONFIG = {
     'availability_zone': ZONE,
     '_has_tpus': True,
 }
+
+
+@pytest.fixture(autouse=True)
+def isolated_allocation_journals(monkeypatch, tmp_path):
+    monkeypatch.setattr(queued_resource_wait, 'JOURNAL_ROOT',
+                        tmp_path / 'waits')
 
 
 def _queued_resource(name='request',
