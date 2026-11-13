@@ -44,6 +44,10 @@ the refresher from collecting peer operations. Terminal launch/teardown outcomes
 still follow the normal ownership and cleanup checks; a stale status never
 authorizes replaying a cloud request.
 
+Controller recovery also advances the next worker ID past every retained
+replica, including failed and terminating workers. A replacement must not
+overwrite their records or collide with an original operation still in flight.
+
 ## Manual verification
 
 1. Run the GCP queued-resource and request executor/restart unit tests in an
@@ -63,3 +67,4 @@ authorizes replaying a cloud request.
    teardown operations must leave their thread pools even when their saved
    replica status was stale. Verify no repeated thread-start errors, and match
    each replacement to its original request or a safely retired prior generation.
+   New worker IDs must exceed all worker IDs retained at controller startup.

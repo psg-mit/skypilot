@@ -261,3 +261,41 @@ def test_failed_teardown_retains_worker_identity(monkeypatch, disposition):
     assert info.cluster_name == 'pool-1'
     assert (info.status_property.sky_down_status ==
             common_utils.ProcessStatus.FAILED)
+
+
+@pytest.mark.parametrize('retained_state',
+                         ['failed', 'terminating', 'pending', 'empty'])
+def test_recovered_scale_up_preserves_existing_worker_ids(
+        monkeypatch, retained_state):
+    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager.lock = threading.RLock()
+    manager._service_name = 'pool'
+    manager._next_replica_id = 1
+    manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+    manager._down_thread_pool = thread_utils.ThreadSafeDict()
+    manager._launch_replica = mock.Mock()
+    manager._terminate_replica = mock.Mock()
+    retained = replica_managers.ReplicaInfo(41, 'pool-41', '-', False, None, 1,
+                                            None)
+    if retained_state == 'failed':
+        retained.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+    elif retained_state == 'terminating':
+        retained.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        retained.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SCHEDULED)
+    records = [] if retained_state == 'empty' else [retained]
+    monkeypatch.setattr(replica_managers.serve_state, 'get_replica_infos',
+                        lambda *_: records)
+    monkeypatch.setattr(
+        replica_managers.serve_state, 'get_replicas_at_status',
+        lambda _, status: [r for r in records if r.status == status])
+
+    manager._recover_replica_operations()
+    manager.scale_up()
+    new_id = manager._launch_replica.call_args.args[0]
+    assert new_id not in {r.replica_id for r in records}
+    assert new_id == (42 if records else 1)
+    manager.scale_up()
+    assert manager._launch_replica.call_args.args[0] == new_id + 1
