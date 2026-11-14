@@ -333,12 +333,19 @@ def test_proven_rejected_create_can_retire_only_after_provider_absence(
     case.api.queuedResources().delete.assert_not_called()
 
 
-def test_audited_enrollment_preserves_original_receipt(case, monkeypatch):
+@pytest.mark.parametrize('wire_format', ['task', 'dag', 'multiple_tasks'])
+def test_audited_enrollment_preserves_original_receipt(case, monkeypatch,
+                                                       wire_format):
 
     base = 'name: pool\nresources:\n  cpus: 1\n'
     task = task_lib.Task.from_yaml_str(base)
     task.update_envs({constants.REPLICA_ID_ENV_VAR: '3'})
     case.body.task = yaml.safe_dump(task.to_yaml_config())
+    if wire_format != 'task':
+        documents = [{'name': 'original-pool-launch'}, task.to_yaml_config()]
+        if wire_format == 'multiple_tasks':
+            documents.append(task.to_yaml_config())
+        case.body.task = yaml.safe_dump_all(documents)
     monkeypatch.setattr(cleanup.serve_state, 'get_yaml_content',
                         lambda *_: base)
     monkeypatch.setattr(
@@ -359,6 +366,12 @@ def test_audited_enrollment_preserves_original_receipt(case, monkeypatch):
     value.pop('pool_owner')
     cleanup.queue.save(case.path, value)
     digest = hashlib.sha256(case.path.read_bytes()).hexdigest()
+    if wire_format == 'multiple_tasks':
+        with pytest.raises(ValueError, match='exactly one task'):
+            cleanup.bind_retained_allocation(case.path, case.owner, digest)
+        assert 'pool_owner' not in cleanup.queue.load(case.path)
+        case.api.queuedResources().delete.assert_not_called()
+        return
     cleanup.bind_retained_allocation(case.path, case.owner, digest)
     enrolled = cleanup.queue.load(case.path)
     assert enrolled['pool_owner'] == dataclasses.asdict(case.owner)

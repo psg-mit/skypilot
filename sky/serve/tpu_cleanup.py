@@ -29,6 +29,7 @@ from sky.serve import serve_utils
 from sky.server.requests import payloads
 from sky.server.requests import restart_recovery
 from sky.utils import common_utils
+from sky.utils import dag_utils
 from sky.utils import locks
 
 api_requests = adaptors_common.LazyImport('sky.server.requests.requests')
@@ -327,7 +328,10 @@ def bind_retained_allocation(path: pathlib.Path, owner: PoolAllocationOwner,
                for a in attempts):
         raise ValueError('Original provider launch lineage is missing')
     request = api_requests.get_request(owner.request_id)
-    original = task_lib.Task.from_yaml_str(request.request_body.task)
+    dag = dag_utils.load_chain_dag_from_yaml_str(request.request_body.task)
+    if len(dag.tasks) != 1:
+        raise ValueError('Original pool launch must contain exactly one task')
+    original = dag.tasks[0]
     pool_yaml = serve_state.get_yaml_content(owner.service_name, owner.version)
     if pool_yaml is None:
         raise ValueError('Original pool definition is missing')
