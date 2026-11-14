@@ -4740,6 +4740,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             RuntimeError: If the cluster fails to be terminated/stopped.
         """
         cluster_name = handle.cluster_name
+        resources = handle.launched_resources
+        durable_tpu = (
+            os.environ.get('SKYPILOT_DURABLE_TPU_REQUESTS') == '1' and
+            isinstance(resources.cloud, clouds.GCP) and any(
+                name.startswith('tpu-')
+                for name in (resources.accelerators or {})) and
+            (resources.accelerator_args or {}).get('api') != 'compute')
         # Check if the cluster is owned by the current user. Raise
         # exceptions.ClusterOwnerIdentityMismatchError
         yellow = colorama.Fore.YELLOW
@@ -4749,7 +4756,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             backend_utils.check_owner_identity(cluster_name)
         except (exceptions.ClusterOwnerIdentityMismatchError,
                 exceptions.CloudUserIdentityError) as e:
-            if purge:
+            if purge and not durable_tpu:
                 logger.error(e)
                 verbed = 'terminated' if terminate else 'stopped'
                 logger.warning(
@@ -4763,6 +4770,23 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 raise
         lock_id = backend_utils.cluster_status_lock_id(cluster_name)
         lock = locks.get_lock(lock_id, timeout=1)
+
+        if durable_tpu:
+            # Unlinking an advisory lock lets a second inode be locked while
+            # the original owner still holds the first. Explicit pool/job
+            # cancellation already resolves its exact creator; never cancel
+            # unrelated or preserved successor requests as a teardown shortcut.
+            try:
+                with lock:
+                    self.teardown_no_lock(handle,
+                                          terminate,
+                                          purge,
+                                          refresh_cluster_status=True)
+            except locks.LockTimeout as error:
+                raise RuntimeError(
+                    'TPU native lock remains owned; retain teardown for retry'
+                ) from error
+            return
         # Retry in case new cluster operation comes in and holds the lock
         # right after the lock is removed.
         n_attempts = 2

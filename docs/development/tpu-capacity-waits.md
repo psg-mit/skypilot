@@ -148,3 +148,8 @@ resource/wait tests, the replica-manager tests and request retention/restart
 tests in an isolated runtime. After deployment observe at least two controller
 passes, retained original request IDs and immutable inputs, exact provider
 deletion/absence, successor progress, and unchanged active jobs/checkpoints.
+
+Durable Cloud TPU teardown honors existing native locks and never unlinks them
+or cancels other cluster requests to acquire ownership. A busy lock retains
+the original teardown for bounded retry. Explicit controllers cancel only their
+exact owned creator before cleanup; maintenance and successor fences survive.

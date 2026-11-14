@@ -4,6 +4,7 @@ import contextlib
 import copy
 import dataclasses
 import hashlib
+import pathlib
 import threading
 from types import SimpleNamespace
 from unittest import mock
@@ -16,6 +17,7 @@ import yaml
 from sky import backends
 from sky import clouds
 from sky import task as task_lib
+from sky.backends import cloud_vm_ray_backend
 from sky.provision import common
 from sky.provision.gcp import instance_utils
 from sky.serve import constants
@@ -24,6 +26,7 @@ from sky.serve import tpu_cleanup as cleanup
 from sky.server.requests import payloads
 from sky.server.requests import requests
 from sky.utils import common_utils
+from sky.utils import locks
 
 
 @pytest.fixture
@@ -378,3 +381,38 @@ def test_new_launch_persists_independent_cleanup_owner(case, monkeypatch):
                                    version=1))
     assert cleanup.capture_owner(case.owner.native_hash) == dataclasses.asdict(
         case.owner)
+
+
+@pytest.mark.parametrize('busy', [False, True])
+def test_native_tpu_teardown_preserves_lock_inode_and_other_requests(
+        monkeypatch, tmp_path, busy):
+    monkeypatch.setenv('SKYPILOT_DURABLE_TPU_REQUESTS', '1')
+    monkeypatch.setattr(locks, 'SKY_LOCKS_DIR', str(tmp_path))
+    native_get_lock = locks.get_lock
+    monkeypatch.setattr(
+        locks, 'get_lock',
+        lambda lock_id, **_: native_get_lock(lock_id, timeout=0))
+    monkeypatch.setattr(cloud_vm_ray_backend.backend_utils,
+                        'check_owner_identity', lambda _: None)
+    cancel = mock.Mock()
+    monkeypatch.setattr(requests, 'kill_cluster_requests', cancel)
+    backend = object.__new__(backends.CloudVmRayBackend)
+    backend.teardown_no_lock = mock.Mock()
+    handle = SimpleNamespace(cluster_name='logan-pool-3',
+                             launched_resources=SimpleNamespace(
+                                 cloud=clouds.GCP(),
+                                 accelerators={'tpu-v6e-8': 1},
+                                 accelerator_args={'api': 'tpu'}))
+    holder = native_get_lock('logan-pool-3_status', timeout=0)
+    with holder if busy else contextlib.nullcontext():
+        if busy:
+            inode = pathlib.Path(holder.lock_path).stat().st_ino
+            with pytest.raises(RuntimeError, match='lock remains owned'):
+                backend._teardown(handle, terminate=True)
+            assert pathlib.Path(holder.lock_path).stat().st_ino == inode
+            backend.teardown_no_lock.assert_not_called()
+        else:
+            backend._teardown(handle, terminate=True)
+            backend.teardown_no_lock.assert_called_once()
+            assert (tmp_path / '.logan-pool-3_status.lock').exists()
+    cancel.assert_not_called()
