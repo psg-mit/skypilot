@@ -113,3 +113,38 @@ forward repair; restoring a duplicate active row is not a safe rollback.
    replica status was stale. Verify no repeated thread-start errors, and match
    each replacement to its original request or a safely retired prior generation.
    New worker IDs must exceed all worker IDs retained at controller startup.
+
+## Terminal allocation reconciliation
+
+Native pool allocations persist their original pool hash, owner, workspace,
+worker/version, immutable launch digest and native generation in the queue
+journal before creation. Controllers reconcile at most two eligible receipts
+per pass, with a persisted five-minute recheck interval. Cleanup is independent
+of a mutable native cluster row. A missing row cannot certify teardown; native
+state remains until the allocation journal is retired.
+
+The reconciler holds the pool scheduling, native cluster and allocation locks.
+It requires a terminal original creator, unchanged ownership and inputs, no
+assigned jobs, and no executing or unrelated worker API operation. An exactly
+equivalent successor parked in WAITING retains its original request. Every exact
+queue generation must be FAILED/SUSPENDED or absent, and every guest must be
+absent or independently PREEMPTED with matching identity. Live, changed or
+unknown guests block cleanup. Deletion intent and operation handles survive
+restart. A lost reply permits retirement only after independent absence; it
+never blindly repeats deletion. Retire the journal only after every request and
+guest is confirmed absent. Preserve requests and native history throughout.
+Request retention excludes every creator referenced by an unretired journal.
+
+Older receipts require an explicit reviewed enrollment using
+`sky.serve.tpu_cleanup.bind_retained_allocation`. Supply the exact journal
+SHA-256 and original `PoolAllocationOwner`. The native history, provider launch
+lineage, original terminal request and frozen pool definition must agree.
+Reconcile missing history from verified archives first; never fabricate an owner
+from a resource prefix or clear an uncertain create. A durable
+`cleanup_error` and `cleanup_recheck_at` expose unresolved receipts.
+
+Manual verification: run `tests/unit_tests/test_tpu_cleanup.py`, the GCP queued
+resource/wait tests, the replica-manager tests and request retention/restart
+tests in an isolated runtime. After deployment observe at least two controller
+passes, retained original request IDs and immutable inputs, exact provider
+deletion/absence, successor progress, and unchanged active jobs/checkpoints.

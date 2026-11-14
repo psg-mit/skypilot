@@ -88,6 +88,8 @@ from sky.utils import volume as volume_lib
 from sky.utils import yaml_utils
 from sky.utils.plugin_extensions import ExternalFailureSource
 
+pool_tpu_cleanup = adaptors_common.LazyImport('sky.serve.tpu_cleanup')
+
 if typing.TYPE_CHECKING:
     import grpc
 
@@ -5774,6 +5776,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         """
         cluster_name_on_cloud = handle.cluster_name_on_cloud
         cloud = handle.launched_resources.cloud
+
+        # Preserve the route to Cloud TPU cleanup until its exact durable
+        # allocation is retired, including refresh paths with no guest nodes.
+        if terminate and isinstance(cloud, clouds.GCP):
+            if pool_tpu_cleanup.pending_native_allocation(
+                    handle.cluster_name,
+                    global_user_state.get_cluster_hash(handle.cluster_name)):
+                raise provision_common.ProvisionerError(
+                    'TPU cleanup is incomplete; retaining native state')
 
         if terminate and handle.launched_resources.is_image_managed is True:
             # Delete the image when terminating a "cloned" cluster, i.e.,

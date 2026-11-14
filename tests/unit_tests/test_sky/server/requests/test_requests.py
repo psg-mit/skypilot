@@ -13,6 +13,7 @@ import pytest
 
 from sky import core
 from sky import sky_logging
+from sky.provision.gcp import queued_resource_wait
 from sky.server import constants as server_constants
 from sky.server import daemons
 from sky.server.blob import blob_storage as requests_bs
@@ -2485,3 +2486,31 @@ async def test_kill_requests_unscoped_cancels_all(isolated_database):
     cancelled = requests.kill_requests(request_ids=['shutdown-a', 'shutdown-b'],
                                        user_id=None)
     assert set(cancelled) == {'shutdown-a', 'shutdown-b'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('isolated_database')
+async def test_retention_preserves_unretired_tpu_creator(monkeypatch, tmp_path):
+    monkeypatch.setenv('SKYPILOT_DURABLE_TPU_REQUESTS', '1')
+    monkeypatch.setattr(queued_resource_wait, 'JOURNAL_ROOT',
+                        tmp_path / 'waits')
+    journal = queued_resource_wait.JOURNAL_ROOT / 'allocation.json'
+    queued_resource_wait.save(
+        journal, dict(request_id='retained-tpu-creator', stage='waiting'))
+    for request_id in ('retained-tpu-creator', 'collectible-terminal-peer'):
+        await requests.create_if_not_exists_async(
+            requests.Request(request_id=request_id,
+                             name='test-retention',
+                             entrypoint=dummy,
+                             request_body=payloads.RequestBody(),
+                             status=RequestStatus.SUCCEEDED,
+                             created_at=0.0,
+                             finished_at=0.0,
+                             user_id='test-user'))
+    await requests.clean_finished_requests_with_retention(1, batch_size=1)
+    assert await requests.get_request_async('retained-tpu-creator') is not None
+    assert await requests.get_request_async('collectible-terminal-peer') is None
+    queued_resource_wait.save(
+        journal, dict(request_id='retained-tpu-creator', stage='retired'))
+    await requests.clean_finished_requests_with_retention(1, batch_size=1)
+    assert await requests.get_request_async('retained-tpu-creator') is None

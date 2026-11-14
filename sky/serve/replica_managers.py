@@ -30,6 +30,7 @@ from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service
 from sky.serve import spot_placer
+from sky.serve import tpu_cleanup
 from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.usage import usage_lib
@@ -1186,7 +1187,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         # refresh. In this case, we skip spawning a new down thread to save
         # controller resources.
         if not global_user_state.cluster_with_name_exists(info.cluster_name):
-            self._handle_sky_down_finish(info, format_exc=None)
+            if tpu_cleanup.pending_native_allocation(info.cluster_name):
+                self._handle_sky_down_finish(
+                    info,
+                    format_exc='Durable TPU allocation still requires cleanup')
+            else:
+                self._handle_sky_down_finish(info, format_exc=None)
             return
 
         # Otherwise, start the thread to terminate the cluster.
@@ -1431,6 +1437,27 @@ class SkyPilotReplicaManager(ReplicaManager):
                     f'Terminate thread for replica {replica_id} finished.')
                 self._down_thread_pool.pop(replica_id)
                 self._handle_sky_down_finish(info, format_exc=t.format_exc)
+
+        if self._is_pool:
+            excluded = {
+                f'{self._service_name}-{rid}'
+                for rid, _ in self._down_thread_pool.items()
+            }
+            for owner in tpu_cleanup.reconcile_pool(self._service_name,
+                                                    excluded):
+                info = serve_state.get_replica_info_from_id(
+                    self._service_name, owner.replica_id)
+                current = global_user_state.get_cluster_hash(owner.native_name)
+                if (info is not None and
+                        info.cluster_name == owner.native_name and
+                        current in (None, owner.native_hash) and
+                        owner.replica_id not in self._launch_thread_pool and
+                        owner.replica_id not in self._down_thread_pool and
+                        info.status_property.sky_down_status
+                        == common_utils.ProcessStatus.FAILED and
+                        not tpu_cleanup.pending_native_allocation(
+                            owner.native_name)):
+                    self._handle_sky_down_finish(info, format_exc=None)
 
         # Clean old version
         replica_infos = serve_state.get_replica_infos(self._service_name)

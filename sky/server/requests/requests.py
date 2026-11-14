@@ -28,6 +28,7 @@ from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
 from sky.metrics import utils as metrics_lib
+from sky.provision.gcp import queued_resource_wait
 from sky.server import common as server_common
 from sky.server import constants as server_constants
 from sky.server import daemons
@@ -1063,6 +1064,7 @@ class RequestTaskFilter:
     """
     status: Optional[List[RequestStatus]] = None
     request_ids: Optional[List[str]] = None
+    exclude_request_ids: Optional[List[str]] = None
     cluster_names: Optional[List[str]] = None
     user_id: Optional[str] = None
     exclude_request_names: Optional[List[str]] = None
@@ -1105,6 +1107,10 @@ class RequestTaskFilter:
                 id_placeholders = ','.join(['?'] * len(self.request_ids))
                 filters.append(f'request_id IN ({id_placeholders})')
                 filter_params.extend(self.request_ids)
+        if self.exclude_request_ids:
+            placeholders = ','.join(['?'] * len(self.exclude_request_ids))
+            filters.append(f'request_id NOT IN ({placeholders})')
+            filter_params.extend(self.exclude_request_ids)
         if self.include_request_names is not None:
             name_placeholders = ','.join(['?'] *
                                          len(self.include_request_names))
@@ -1457,12 +1463,21 @@ async def clean_finished_requests_with_retention(retention_seconds: int,
     """
     debug_log_dir = pathlib.Path(sky_logging.DEBUG_LOG_DIR)
     total_deleted = 0
+    protected = []
+    if restart_recovery.enabled():
+        # Cleanup needs the original immutable owner even after its launch ends.
+        for path in queued_resource_wait.JOURNAL_ROOT.expanduser().glob(
+                '*.json'):
+            value = queued_resource_wait.load(path)
+            if value.get('stage') != 'retired':
+                protected.append(value['request_id'])
     while True:
         reqs = await get_request_tasks_async(
             req_filter=RequestTaskFilter(status=RequestStatus.finished_status(),
                                          finished_before=time.time() -
                                          retention_seconds,
                                          limit=batch_size,
+                                         exclude_request_ids=protected,
                                          fields=['request_id']))
         if len(reqs) == 0:
             break

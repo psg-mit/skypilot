@@ -17,11 +17,13 @@ from typing import Any, Dict, NoReturn, Optional
 import filelock
 
 from sky import exceptions
+from sky.adaptors import common as adaptors_common
 from sky.adaptors import gcp
 from sky.provision import common
 from sky.utils import common_utils
 from sky.utils import context
 
+pool_cleanup = adaptors_common.LazyImport('sky.serve.tpu_cleanup')
 JOURNAL_ROOT = pathlib.Path('~/.sky/gcp_queue_waits')
 POLL_SECONDS = 30
 QUEUE_TIMEOUT = 6000
@@ -72,13 +74,16 @@ def contract(config: dict, labels: dict, count: int) -> dict:
     return dict(config=config, labels=labels, count=count)
 
 
-def allocation_lock(project: str, zone: str, cluster: str) -> filelock.FileLock:
+def allocation_lock(project: str,
+                    zone: str,
+                    cluster: str,
+                    timeout: float = -1) -> filelock.FileLock:
     """Serialize label ownership, including the first durable create intent."""
     root = JOURNAL_ROOT.expanduser() / 'bindings'
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     key = hashlib.sha256(json.dumps([project, zone,
                                      cluster]).encode()).hexdigest()
-    return filelock.FileLock(str(root / f'{key}.lock'))
+    return filelock.FileLock(str(root / f'{key}.lock'), timeout=timeout)
 
 
 def matching_journals(project: str, zone: str, cluster: str):
@@ -229,24 +234,27 @@ def prepare(path: pathlib.Path, project: str, zone: str, cluster: str,
         canonical = canonical_parent(project, zone)
     except Exception:  # pylint: disable=broad-except
         pause(path, 'TPU project identity unavailable; no create sent')
-    value = dict(version=1,
-                 stage='creating',
-                 request_id=common_utils.get_current_request_id(),
-                 project=project,
-                 zone=zone,
-                 cluster=cluster,
-                 contract=copy.deepcopy(expected),
-                 queue_deadline=time.time() + QUEUE_TIMEOUT,
-                 resources={
-                     name: dict(body=body,
-                                phase='prepared',
-                                canonical_parent=canonical)
-                     for name, body in bodies.items()
-                 })
+    value: dict = dict(version=1,
+                       stage='creating',
+                       request_id=common_utils.get_current_request_id(),
+                       project=project,
+                       zone=zone,
+                       cluster=cluster,
+                       contract=copy.deepcopy(expected),
+                       queue_deadline=time.time() + QUEUE_TIMEOUT,
+                       resources={
+                           name: dict(body=body,
+                                      phase='prepared',
+                                      canonical_parent=canonical)
+                           for name, body in bodies.items()
+                       })
     try:
         value['native_cluster_hash'] = native_cluster_hash()
     except Exception:  # pylint: disable=broad-except
         pause(path, 'Native cluster identity unavailable; no create sent')
+    owner = pool_cleanup.capture_owner(value['native_cluster_hash'])
+    if owner is not None:
+        value['pool_owner'] = owner
     save(path, value)
     return value
 
