@@ -5578,6 +5578,17 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 f'cluster {handle.cluster_name}: '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
         cluster_status_fetched = False
+        # A status refresh with no live TPU guests tries post-teardown cleanup.
+        # Its durable-allocation guard must retain native state while the queue
+        # still exists, but that must not prevent this explicit teardown from
+        # reaching the provider. The normal provider path below fences the
+        # original allocation and removes its queued resources before metadata.
+        if (terminate and
+                isinstance(handle.launched_resources.cloud, clouds.GCP) and
+                pool_tpu_cleanup.pending_native_allocation(
+                    handle.cluster_name,
+                    global_user_state.get_cluster_hash(handle.cluster_name))):
+            refresh_cluster_status = False
         if refresh_cluster_status:
             try:
                 prev_cluster_status, refreshed_handle = (

@@ -48,6 +48,14 @@ Controller recovery also advances the next worker ID past every retained
 replica, including failed and terminating workers. A replacement must not
 overwrite their records or collide with an original operation still in flight.
 
+Recovery of an interrupted failed-worker teardown retains its diagnostic log.
+An already collected launch log need not exist again, and previously collected
+logs must not be truncated or fetched again during controller startup. Explicit
+teardown of a durably owned TPU proceeds through the normal provider cleanup
+before local metadata cleanup; a status refresh with no live guests must not
+short-circuit deletion of an outstanding queued resource. Generation fences and
+the final allocation-retirement guard remain enforced.
+
 ## Duplicate pool bindings
 
 The cloud-label allocation lock serializes new queued TPU creates with native

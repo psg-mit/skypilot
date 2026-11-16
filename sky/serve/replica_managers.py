@@ -931,7 +931,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._service_name, serve_state.ReplicaStatus.SHUTTING_DOWN):
             self._terminate_replica(
                 replica_info.replica_id,
-                sync_down_logs=False,
+                sync_down_logs=not (replica_info.status_property.purged or
+                                    replica_info.status_property.is_scale_down),
                 replica_drain_delay_seconds=0,
                 purge=replica_info.status_property.purged,
                 is_scale_down=replica_info.status_property.is_scale_down)
@@ -1131,12 +1132,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                 serve_utils.generate_replica_launch_log_file_name(
                     self._service_name, replica_id))
             # Write launch log to replica log file
-            with open(log_file_name, 'w',
-                      encoding='utf-8') as replica_log_file, open(
-                          launch_log_file_name, 'r',
-                          encoding='utf-8') as launch_file:
-                replica_log_file.write(launch_file.read())
-            os.remove(launch_log_file_name)
+            # Recovery may already have moved this log before the controller
+            # stopped. Preserve the retained log and do not require the old
+            # launch file in order to finish the original teardown.
+            if os.path.exists(launch_log_file_name):
+                with open(log_file_name, 'a',
+                          encoding='utf-8') as replica_log_file, open(
+                              launch_log_file_name, 'r',
+                              encoding='utf-8') as launch_file:
+                    replica_log_file.write(launch_file.read())
+                os.remove(launch_log_file_name)
+            elif os.path.exists(log_file_name):
+                logger.info('Retaining previously collected logs for replica '
+                            f'{replica_id}.')
+                return
 
             logger.info(f'Syncing down logs for replica {replica_id}...')
             backend = backends.CloudVmRayBackend()

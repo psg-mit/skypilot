@@ -735,6 +735,46 @@ class TestCloudVmRayBackendTeardownNoLock:
         mock_run_on_head.assert_not_called()
         mock_get_yaml.assert_called_once_with(refreshed_handle.cluster_yaml)
 
+    @pytest.mark.parametrize('pending', [False, True])
+    def test_durable_tpu_teardown_reaches_provider_before_metadata_cleanup(
+            self, monkeypatch, pending):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('pool-41',
+                                   '/tmp/original.yaml',
+                                   has_ray=False)
+        handle.launched_resources.cloud = clouds.GCP()
+        refresh = MagicMock(return_value=(status_lib.ClusterStatus.INIT,
+                                          handle))
+        monkeypatch.setattr(backend_utils, 'refresh_cluster_status_handle',
+                            refresh)
+        monkeypatch.setattr(cloud_vm_ray_backend.pool_tpu_cleanup,
+                            'pending_native_allocation', lambda *_: pending)
+        state = cloud_vm_ray_backend.global_user_state
+        monkeypatch.setattr(state, 'get_cluster_hash', lambda _: 'original')
+        monkeypatch.setattr(state, 'get_status_from_cluster_name',
+                            lambda _: status_lib.ClusterStatus.INIT)
+        monkeypatch.setattr(state, 'get_cluster_yaml_dict',
+                            lambda _: {'provider': {
+                                'original': True
+                            }})
+        monkeypatch.setattr(cloud_vm_ray_backend.requests_lib,
+                            'kill_cluster_requests', MagicMock())
+        teardown = MagicMock()
+        monkeypatch.setattr(cloud_vm_ray_backend.provisioner,
+                            'teardown_cluster', teardown)
+        cleanup = MagicMock(
+            side_effect=lambda *_: teardown.assert_called_once())
+        monkeypatch.setattr(backend, 'post_teardown_cleanup', cleanup)
+
+        backend.teardown_no_lock(handle, terminate=True)
+
+        assert refresh.call_count == int(not pending)
+        teardown.assert_called_once()
+        assert teardown.call_args.kwargs['provider_config'] == {
+            'original': True
+        }
+        cleanup.assert_called_once()
+
 
 class TestNewHandleRuntimeMetadata:
     """Runtime metadata a freshly constructed handle starts with."""

@@ -299,3 +299,56 @@ def test_recovered_scale_up_preserves_existing_worker_ids(
     assert new_id == (42 if records else 1)
     manager.scale_up()
     assert manager._launch_replica.call_args.args[0] == new_id + 1
+
+
+@pytest.mark.parametrize('has_launch_log', [False, True])
+def test_recover_failed_worker_teardown_preserves_logs(monkeypatch, tmp_path,
+                                                       has_launch_log):
+    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager.lock = threading.RLock()
+    manager._service_name = 'pool'
+    manager._is_pool = True
+    manager._launch_thread_pool = {}
+    manager._down_thread_pool = {}
+    manager._handle_sky_down_finish = mock.Mock()
+    info = replica_managers.ReplicaInfo(41, 'pool-41', '-', False, None, 1,
+                                        None)
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
+    info.status_property.sky_down_status = common_utils.ProcessStatus.RUNNING
+    assert (info.status ==
+            replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
+    launch_log = tmp_path / 'launch.log'
+    retained_log = tmp_path / 'replica.log'
+    retained_log.write_text('previous attempt\n')
+    if has_launch_log:
+        launch_log.write_text('latest attempt\n')
+    monkeypatch.setattr(replica_managers.serve_state, 'get_replica_infos',
+                        lambda *_: [info])
+    monkeypatch.setattr(
+        replica_managers.serve_state, 'get_replicas_at_status',
+        lambda _, status: [info] if info.status == status else [])
+    monkeypatch.setattr(replica_managers.serve_state,
+                        'get_replica_info_from_id', lambda *_: info)
+    monkeypatch.setattr(replica_managers.serve_utils,
+                        'generate_replica_launch_log_file_name',
+                        lambda *_: str(launch_log))
+    monkeypatch.setattr(replica_managers.serve_utils,
+                        'generate_replica_log_file_name',
+                        lambda *_: str(retained_log))
+    monkeypatch.setattr(replica_managers.global_user_state,
+                        'get_handle_from_cluster_name', lambda _: None)
+    monkeypatch.setattr(replica_managers.global_user_state,
+                        'cluster_with_name_exists', lambda _: False)
+    monkeypatch.setattr(replica_managers.tpu_cleanup,
+                        'pending_native_allocation', lambda _: True)
+
+    manager._recover_replica_operations()
+    manager._recover_replica_operations()
+
+    assert retained_log.read_text() == (
+        'previous attempt\n' + ('latest attempt\n' if has_launch_log else ''))
+    assert not launch_log.exists()
+    assert manager._next_replica_id == 42
+    assert manager._handle_sky_down_finish.call_count == 2
+    assert 'requires cleanup' in (
+        manager._handle_sky_down_finish.call_args.kwargs['format_exc'])
