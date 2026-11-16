@@ -348,6 +348,25 @@ def test_proven_rejected_create_can_retire_only_after_provider_absence(
     case.api.queuedResources().delete.assert_not_called()
 
 
+@pytest.mark.parametrize('code', [400, 401, 403, 429, 500])
+def test_durable_http_rejection_needs_exact_absence(case, monkeypatch, code):
+    case.resources.clear()
+    value = cleanup.queue.load(case.path)
+    row = value['resources'][case.name]
+    row.pop('create_time')
+    row['phase'] = 'rejected'
+    row['create_error'] = dict(code=code, message='provider response')
+    cleanup.queue.save(case.path, value)
+    monkeypatch.setattr(cleanup.queue, '_operation_error', lambda _: None)
+    if code == 500:
+        with pytest.raises(ValueError, match='Uncertain TPU create'):
+            cleanup.reconcile_allocation(case.path)
+    else:
+        cleanup.reconcile_allocation(case.path)
+        assert cleanup.queue.load(case.path)['stage'] == 'retired'
+    case.api.queuedResources().delete.assert_not_called()
+
+
 @pytest.mark.parametrize('wire_format', ['task', 'dag', 'multiple_tasks'])
 def test_audited_enrollment_preserves_original_receipt(case, monkeypatch,
                                                        wire_format):

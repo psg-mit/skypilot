@@ -35,8 +35,7 @@ def resumable(request) -> bool:
         return True
     if request.name != 'sky.launch':
         return False
-    for path in queued_resource_wait.JOURNAL_ROOT.expanduser().glob('*.json'):
-        value = queued_resource_wait.load(path)
+    for _, value in queued_resource_wait.journals():
         if (value['request_id'] == request.request_id and
                 value.get('stage') in ('creating', 'waiting')):
             return True
@@ -84,10 +83,7 @@ def managed_launch_request(job_id: int, task_id: int, cluster_name: str):
         if request.status == requests.RequestStatus.SUCCEEDED:
             # A finished launch can be attached only in its current native
             # generation; an old successful attempt must never be reused.
-            journals = [
-                queued_resource_wait.load(p) for p in
-                queued_resource_wait.JOURNAL_ROOT.expanduser().glob('*.json')
-            ]
+            journals = [v for _, v in queued_resource_wait.journals()]
             current = global_user_state.get_cluster_hash(cluster_name)
             if not any(v['request_id'] == request.request_id and
                        v.get('stage') == 'ready' and

@@ -28,6 +28,7 @@ JOURNAL_ROOT = pathlib.Path('~/.sky/gcp_queue_waits')
 POLL_SECONDS = 30
 QUEUE_TIMEOUT = 6000
 PROVISIONING_GRACE = 900
+DEFINITIVE_CREATE_ERRORS = (400, 401, 403, 429)
 
 
 def journal_path(request_id: str, project: str, zone: str,
@@ -61,6 +62,29 @@ def load(path: pathlib.Path) -> Dict[str, Any]:
         pause(path, 'TPU journal unreadable; reconciliation required')
 
 
+def journals():
+    """Read live receipts, tolerating only a proven retired-receipt move."""
+    for path in JOURNAL_ROOT.expanduser().glob('*.json'):
+        try:
+            value = load(path)
+        except exceptions.ExecutionPausedError as error:
+            if not isinstance(error.__context__, FileNotFoundError):
+                raise
+            retired = False
+            for archived in (path.parent /
+                             'retired').glob(f'{path.stem}-*.json'):
+                previous = load(archived)
+                if (previous.get('stage') == 'retired' and journal_path(
+                        previous['request_id'], previous['project'],
+                        previous['zone'], previous['cluster']) == path):
+                    retired = True
+                    break
+            if not retired:
+                raise
+            continue
+        yield path, value
+
+
 def pause(path: pathlib.Path, reason: str) -> NoReturn:
     raise exceptions.ExecutionPausedError(
         reason,
@@ -88,8 +112,7 @@ def allocation_lock(project: str,
 
 def matching_journals(project: str, zone: str, cluster: str):
     """Read original allocation ownership without changing any journal."""
-    for path in JOURNAL_ROOT.expanduser().glob('*.json'):
-        value = load(path)
+    for path, value in journals():
         if ((value['project'], value['zone'], value['cluster'])
                 == (project, zone, cluster) and
                 value.get('stage') != 'retired'):
@@ -174,8 +197,7 @@ def validate_existing_nodes(path: pathlib.Path, nodes: list) -> None:
 
 def retire(project: str, zone: str, cluster: str) -> None:
     """Called only after native teardown verified the entire queue is absent."""
-    for path in JOURNAL_ROOT.expanduser().glob('*.json'):
-        value = load(path)
+    for path, value in journals():
         if (value['project'], value['zone'],
                 value['cluster']) == (project, zone, cluster):
             for name, row in value['resources'].items():
@@ -200,8 +222,7 @@ def validate_teardown(project: str, zone: str, cluster: str,
                       resources: dict) -> None:
     """Fence known generations and uncertain creates before native deletion."""
     current_hash = native_cluster_hash()
-    for path in JOURNAL_ROOT.expanduser().glob('*.json'):
-        value = load(path)
+    for path, value in journals():
         if ((value['project'], value['zone'], value['cluster']) !=
             (project, zone, cluster) or value.get('stage') == 'retired'):
             continue
@@ -375,6 +396,11 @@ def check(path: pathlib.Path, *, raise_terminal: bool = False) -> bool:
     for name, row in value['resources'].items():
         if row['phase'] == 'prepared':
             return True  # The executor still has an unsent create to perform.
+        if (row['phase'] == 'rejected' and row.get(
+                'create_error', {}).get('code') in DEFINITIVE_CREATE_ERRORS):
+            if raise_terminal:
+                _raise_terminal(name, row['create_error'])
+            return True
         try:
             operation_error = _operation_error(row)
             if operation_error:
@@ -460,8 +486,10 @@ def create(path: pathlib.Path) -> list:
                 body=row['body']).execute(num_retries=0)
         except Exception as error:  # pylint: disable=broad-except
             if (isinstance(error, gcp.http_error_exception()) and
-                    error.resp.status in (400, 401, 403)):
+                    error.resp.status in DEFINITIVE_CREATE_ERRORS):
                 row['phase'] = 'rejected'
+                row['create_error'] = dict(code=error.resp.status,
+                                           message=str(error))
                 save(path, value)
                 raise  # A definitive rejection follows normal native teardown.
             pause(path,

@@ -147,6 +147,14 @@ never blindly repeats deletion. Retire the journal only after every request and
 guest is confirmed absent. Preserve requests and native history throughout.
 Request retention excludes every creator referenced by an unretired journal.
 
+HTTP 429 quota rejections, like definitive 400/401/403 rejections, persist the
+original provider error before returning to normal native failure/backoff.
+They must not become uncertain creates after restart. Cleanup still requires
+independent request and guest absence. HTTP 5xx and lost responses remain
+uncertain. Journal scans tolerate a concurrent move only after finding the
+same receipt durably archived as retired; other missing or unreadable receipts
+continue to fence recovery.
+
 Older receipts require an explicit reviewed enrollment using
 `sky.serve.tpu_cleanup.bind_retained_allocation`. Supply the exact journal
 SHA-256 and original `PoolAllocationOwner`. The native history, provider launch

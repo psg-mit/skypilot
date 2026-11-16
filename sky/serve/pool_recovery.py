@@ -92,9 +92,7 @@ def _find_existing_launch(body: payloads.LaunchBody) -> Optional[str]:
         if succeeded:
             # Never attach to an earlier successful incarnation of this name.
             current = global_user_state.get_cluster_hash(body.cluster_name)
-            journals = (queued_resource_wait.load(p)
-                        for p in queued_resource_wait.JOURNAL_ROOT.expanduser().
-                        glob('*.json'))
+            journals = (v for _, v in queued_resource_wait.journals())
             if not current or not any(
                     v['request_id'] == request.request_id and v.get('stage') ==
                     'ready' and v.get('native_cluster_hash') == current

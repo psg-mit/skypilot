@@ -1466,9 +1466,7 @@ async def clean_finished_requests_with_retention(retention_seconds: int,
     protected = []
     if restart_recovery.enabled():
         # Cleanup needs the original immutable owner even after its launch ends.
-        for path in queued_resource_wait.JOURNAL_ROOT.expanduser().glob(
-                '*.json'):
-            value = queued_resource_wait.load(path)
+        for _, value in queued_resource_wait.journals():
             if value.get('stage') != 'retired':
                 protected.append(value['request_id'])
     while True:

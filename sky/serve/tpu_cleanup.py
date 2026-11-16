@@ -95,8 +95,7 @@ def pending_native_allocation(native_name: str,
     """A missing native row is not proof that its cloud resources are absent."""
     if not restart_recovery.enabled():
         return False
-    for path in queue.JOURNAL_ROOT.expanduser().glob('*.json'):
-        value = queue.load(path)
+    for _, value in queue.journals():
         if value.get('stage') == 'retired':
             continue
         owner = value.get('pool_owner', {})
@@ -169,8 +168,10 @@ def _terminal_resources(value: dict, api) -> tuple:
     for name, row in value['resources'].items():
         resource = _get(api.queuedResources(), name)
         if not row.get('create_time'):
+            rejected = (row.get('create_error', {}).get('code')
+                        in queue.DEFINITIVE_CREATE_ERRORS)
             if (resource is not None or row.get('phase') != 'rejected' or
-                    not queue._operation_error(row)):
+                    not (rejected or queue._operation_error(row))):
                 raise ValueError(
                     'Uncertain TPU create requires operator reconciliation')
         if resource is not None:
@@ -272,8 +273,7 @@ def reconcile_pool(service_name: str, excluded_clusters=()) -> list:
     completed = []
     candidates = []
     active_statuses = api_requests.RequestStatus.active_statuses()
-    for path in queue.JOURNAL_ROOT.expanduser().glob('*.json'):
-        value = queue.load(path)
+    for path, value in queue.journals():
         owner = value.get('pool_owner', {})
         if (owner.get('service_name') != service_name or
                 owner.get('native_name') in excluded_clusters or

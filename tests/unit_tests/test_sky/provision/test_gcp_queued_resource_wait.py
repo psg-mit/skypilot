@@ -4,6 +4,7 @@
 import asyncio
 import copy
 import json
+import pathlib
 import pickle
 import threading
 from unittest import mock
@@ -191,6 +192,48 @@ def test_intent_committed_before_mutation_and_unsent_group_resumes(queue):
     with pytest.raises(exceptions.ExecutionPausedError):
         _create(2)
     assert api.create.call_count == 2
+
+
+@pytest.mark.parametrize('status', [400, 401, 403, 429])
+def test_definitive_create_rejection_survives_restart(queue, status):
+    api, _ = queue
+    api.create.side_effect = lambda **_: mock.Mock(
+        execute=mock.Mock(side_effect=_http_error(status)))
+    with pytest.raises(errors.HttpError):
+        _create()
+    row = next(iter(wait.load(_path())['resources'].values()))
+    assert row['phase'] == 'rejected'
+    assert row['create_error']['code'] == status
+    assert wait.check(_path())
+    with pytest.raises(common.ProvisionerError):
+        wait.wait(_path())
+    assert api.create.call_count == 1
+
+
+@pytest.mark.parametrize('retired', [True, False])
+def test_journal_scan_fences_disappearance_unless_retirement_is_proven(
+        queue, monkeypatch, retired):
+    with pytest.raises(exceptions.ExecutionPausedError):
+        _create()
+    value = wait.load(_path())
+    if retired:
+        value['stage'] = 'retired'
+        wait.save(_path(), value)
+    original_read = pathlib.Path.read_text
+
+    def move_during_read(path, *args, **kwargs):
+        if path == _path():
+            archive = path.parent / 'retired'
+            archive.mkdir(exist_ok=True)
+            path.rename(archive / f'{path.stem}-1.json')
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, 'read_text', move_during_read)
+    if retired:
+        assert list(wait.journals()) == []
+    else:
+        with pytest.raises(exceptions.ExecutionPausedError):
+            list(wait.journals())
 
 
 def test_deadline_and_one_provisioning_grace_survive_reentry(
