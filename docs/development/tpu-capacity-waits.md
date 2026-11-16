@@ -55,6 +55,10 @@ teardown of a durably owned TPU proceeds through the normal provider cleanup
 before local metadata cleanup; a status refresh with no live guests must not
 short-circuit deletion of an outstanding queued resource. Generation fences and
 the final allocation-retirement guard remain enforced.
+Status refreshes with no running guests report INIT while retaining a durable
+TPU allocation's native handle and generation. Pool probes can then recognize
+preemption and request the existing controller's teardown, without a read-side
+cleanup attempting a provider mutation outside its original API context.
 
 ## Duplicate pool bindings
 

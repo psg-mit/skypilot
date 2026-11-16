@@ -283,6 +283,14 @@ def reconcile_pool(service_name: str, excluded_clusters=()) -> list:
         creator = api_requests.get_request(owner['request_id'])
         if creator and creator.status in active_statuses:
             continue
+        replica = serve_state.get_replica_info_from_id(service_name,
+                                                       owner['replica_id'])
+        if replica and replica.status in (serve_state.ReplicaStatus.READY,
+                                          serve_state.ReplicaStatus.NOT_READY):
+            # A successful creator remains terminal for the lifetime of a
+            # healthy worker; it is not a cleanup failure. The deletion fence
+            # still rechecks readiness immediately before every provider RPC.
+            continue
         candidates.append((value.get('cleanup_recheck_at', 0), path))
     for _, path in sorted(candidates)[:2]:
         value = queue.load(path)

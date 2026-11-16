@@ -101,6 +101,7 @@ else:
     grpc = adaptors_common.LazyImport('grpc')
 
 logger = sky_logging.init_logger(__name__)
+pool_tpu_cleanup = adaptors_common.LazyImport('sky.serve.tpu_cleanup')
 
 # NOTE: keep in sync with the cluster template 'file_mounts'.
 SKY_REMOTE_APP_DIR = '~/.sky/sky_app'
@@ -3361,6 +3362,31 @@ def _update_cluster_status(
         except Exception as e:  # pylint: disable=broad-except
             logger.debug('Failed to record autodown event for '
                          f'{cluster_name!r}: {e}')
+
+    # A status read must not delete the native binding of a durable TPU wait.
+    # In particular, a pool's preemption probe runs outside an API teardown
+    # context. Report the missing/stopped guests as unavailable, retaining the
+    # exact handle and generation for the owning controller's fenced teardown.
+    if (isinstance(launched_resources.cloud, clouds.GCP) and
+            pool_tpu_cleanup.pending_native_allocation(cluster_name,
+                                                       record['cluster_hash'])):
+        global_user_state.add_cluster_event(
+            cluster_name,
+            status_lib.ClusterStatus.INIT,
+            f'All nodes {verb}; retaining durable TPU allocation for cleanup.',
+            global_user_state.ClusterEventType.STATUS_CHANGE,
+            nop_if_duplicate=True)
+        global_user_state.add_or_update_cluster(
+            cluster_name,
+            handle,
+            requested_resources=None,
+            ready=False,
+            is_launch=False,
+            existing_cluster_hash=record['cluster_hash'])
+        return global_user_state.get_cluster_from_name(
+            cluster_name,
+            include_user_info=include_user_info,
+            summary_response=summary_response)
 
     global_user_state.add_cluster_event(
         cluster_name,

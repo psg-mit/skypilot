@@ -11,6 +11,8 @@ import datetime
 import time
 from unittest import mock
 
+import pytest
+
 from sky import backends
 from sky import clouds
 from sky.backends import backend_utils
@@ -83,6 +85,56 @@ def _capture_init_log_message(node_statuses,
                                              record,
                                              retry_if_missing=False)
     return captured.get('message', '')
+
+
+@pytest.mark.parametrize('stopped', [False, True])
+@pytest.mark.parametrize('pending', [False, True])
+def test_durable_tpu_status_read_retains_binding_for_preemption_recovery(
+        monkeypatch, stopped, pending):
+    handle = _make_handle()
+    handle.launched_resources.cloud = clouds.GCP()
+    handle.provision_runtime_metadata.has_ray = False
+    record = _make_record(handle)
+    nodes = ({
+        'node': (status_lib.ClusterStatus.STOPPED, None)
+    } if stopped else {})
+    monkeypatch.setattr(backend_utils, '_query_cluster_status_via_cloud_api',
+                        lambda *_a, **_kw: nodes)
+    monkeypatch.setattr(backend_utils.ExternalFailureSource, 'get',
+                        lambda *_a, **_kw: None)
+    ownership = mock.Mock(return_value=pending)
+    monkeypatch.setattr(backend_utils.pool_tpu_cleanup,
+                        'pending_native_allocation', ownership)
+    save = mock.Mock()
+    event = mock.Mock()
+    monkeypatch.setattr(backend_utils.global_user_state,
+                        'add_or_update_cluster', save)
+    monkeypatch.setattr(backend_utils.global_user_state, 'add_cluster_event',
+                        event)
+    monkeypatch.setattr(backend_utils.global_user_state,
+                        'get_cluster_from_name', lambda *_a, **_kw: record)
+    cleanup = mock.Mock()
+    monkeypatch.setattr(backend_utils.backends.CloudVmRayBackend,
+                        'post_teardown_cleanup', cleanup)
+
+    backend_utils._update_cluster_status('test-cluster',
+                                         record,
+                                         retry_if_missing=False)
+
+    ownership.assert_called_once_with('test-cluster', 'fake-hash')
+    if pending:
+        cleanup.assert_not_called()
+        save.assert_called_once_with('test-cluster',
+                                     handle,
+                                     requested_resources=None,
+                                     ready=False,
+                                     is_launch=False,
+                                     existing_cluster_hash='fake-hash')
+        assert event.call_args.args[1] == status_lib.ClusterStatus.INIT
+    else:
+        cleanup.assert_called_once_with(handle,
+                                        terminate=not stopped,
+                                        purge=False)
 
 
 class TestUpdateClusterStatusInitReason:

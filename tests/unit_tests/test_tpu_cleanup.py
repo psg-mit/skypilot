@@ -270,6 +270,21 @@ def test_controller_rechecks_with_durable_error_and_backoff(case):
     case.api.queuedResources().delete.assert_not_called()
 
 
+@pytest.mark.parametrize('status', [
+    cleanup.serve_state.ReplicaStatus.READY,
+    cleanup.serve_state.ReplicaStatus.NOT_READY
+])
+def test_healthy_completed_launch_is_not_a_cleanup_candidate(
+        case, monkeypatch, status):
+    replica = SimpleNamespace(status=status)
+    monkeypatch.setattr(cleanup.serve_state, 'get_replica_info_from_id',
+                        lambda *_: replica)
+    original = case.path.read_bytes()
+    assert not cleanup.reconcile_pool('logan-pool')
+    assert case.path.read_bytes() == original
+    case.api.queuedResources().delete.assert_not_called()
+
+
 def test_missing_cluster_row_cannot_complete_pool_teardown(case, monkeypatch):
 
     manager = object.__new__(replica_managers.SkyPilotReplicaManager)
