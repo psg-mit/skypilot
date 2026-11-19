@@ -2,6 +2,7 @@
 # pylint: disable=redefined-outer-name
 import contextlib
 import json
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -16,6 +17,7 @@ from sky.clouds.gcp import GCP
 from sky.jobs import state as managed_job_state
 from sky.jobs.server import core as managed_jobs_core
 from sky.policies import tpu_quota
+from sky.server.requests import payloads
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
 from sky.utils import admin_policy_utils
@@ -445,6 +447,89 @@ def test_jobs_launch_is_gated(quota_file, usage):
                 'bob',
                 'tpu-v5p-8',
                 request_name=request_names.AdminPolicyRequestName.JOBS_LAUNCH))
+
+
+@pytest.fixture
+def pool_job_receipt(monkeypatch):
+    receipt = SimpleNamespace(name='sky.jobs.launch',
+                              user_id='h',
+                              request_body=payloads.JobsLaunchBody(
+                                  task='',
+                                  name='train',
+                                  pool='existing-pool',
+                                  env_vars={}))
+    monkeypatch.setattr(common_utils, 'is_in_request_context', lambda: True)
+    monkeypatch.setattr(common_utils, 'get_current_request_id',
+                        lambda: 'req-me')
+    monkeypatch.setattr(api_requests, 'get_request', lambda _: receipt)
+    return receipt
+
+
+def test_pool_job_reuses_capacity_even_when_pool_is_over_quota(
+        quota_file, usage, pool_job_receipt):
+    del pool_job_receipt
+    quota_file(_LIMITS)
+    usage['clusters'] = [_cluster('alice', {'tpu-v5p-8': 1}, num_nodes=10)]
+    _apply(
+        _request('bob',
+                 'tpu-v5p-8',
+                 request_name=request_names.AdminPolicyRequestName.JOBS_LAUNCH))
+    assert usage['admitted'] == []
+    assert usage['lock'].acquisitions == 0
+    # The physical pool's next worker still needs quota.
+    with pytest.raises(exceptions.ExecutionPausedError):
+        _apply(
+            _request('bob',
+                     'tpu-v5p-8',
+                     request_name=request_names.AdminPolicyRequestName.
+                     SERVE_LAUNCH_REPLICA))
+
+
+@pytest.mark.parametrize('mismatch', [
+    'missing_context',
+    'missing_receipt',
+    'wrong_request',
+    'wrong_owner',
+    'wrong_body',
+    'no_pool',
+    'empty_pool',
+])
+def test_pool_job_exemption_requires_exact_server_receipt(
+        quota_file, usage, pool_job_receipt, monkeypatch, mismatch):
+    quota_file(_LIMITS)
+    usage['clusters'] = [_cluster('alice', {'tpu-v5p-8': 1}, num_nodes=3)]
+    if mismatch == 'missing_context':
+        monkeypatch.setattr(common_utils, 'is_in_request_context',
+                            lambda: False)
+    elif mismatch == 'missing_receipt':
+        monkeypatch.setattr(api_requests, 'get_request', lambda _: None)
+    elif mismatch == 'wrong_request':
+        pool_job_receipt.name = 'sky.launch'
+    elif mismatch == 'wrong_owner':
+        pool_job_receipt.user_id = 'someone-else'
+    elif mismatch == 'wrong_body':
+        pool_job_receipt.request_body = SimpleNamespace(pool='existing-pool')
+    elif mismatch == 'no_pool':
+        pool_job_receipt.request_body.pool = None
+    else:
+        pool_job_receipt.request_body.pool = ''
+    request = _request(
+        'bob',
+        'tpu-v5p-8',
+        request_name=request_names.AdminPolicyRequestName.JOBS_LAUNCH)
+    request.task.metadata.update({'pool': 'existing-pool'})
+    with pytest.raises(exceptions.ExecutionPausedError):
+        _apply(request)
+    assert usage['admitted'] == []
+
+
+def test_pool_job_exemption_does_not_apply_to_cluster_launch(
+        quota_file, usage, pool_job_receipt):
+    del pool_job_receipt
+    quota_file(_LIMITS)
+    usage['clusters'] = [_cluster('alice', {'tpu-v5p-8': 1}, num_nodes=3)]
+    with pytest.raises(exceptions.ExecutionPausedError):
+        _apply(_request('bob', 'tpu-v5p-8'))
 
 
 def test_paused_error_propagates_through_admin_policy_utils(

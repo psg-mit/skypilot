@@ -38,6 +38,9 @@ Compute Engine API count the same way.
 
 Gated requests are ``sky launch``, ``sky jobs launch`` and the worker and
 replica launches that the pool and serve controllers send to the API server.
+A managed-job request targeting a pool needs no additional allocation and is
+not gated: its pool workers remain gated when they launch. This exemption uses
+the server's typed request receipt, not task metadata supplied by a client.
 A pool worker that does not fit is parked like any other launch, so a pool
 scales up only into free quota and releases it when it scales down.
 ``sky jobs pool apply`` and ``sky serve up`` are rejected only when a single
@@ -67,6 +70,7 @@ from sky import sky_logging
 from sky.backends import backend_utils
 from sky.jobs import state as managed_job_state
 from sky.jobs.server import core as managed_jobs_core
+from sky.server.requests import payloads
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
 from sky.utils import common
@@ -232,6 +236,25 @@ def paused_error(message: str) -> exceptions.ExecutionPausedError:
         message,
         hint='Cancel the request with `sky api cancel` to stop waiting.',
         retry_wait_seconds=RETRY_WAIT_SECONDS)
+
+
+def _is_pool_job_request(user_request: admin_policy.UserRequest) -> bool:
+    """Identify a non-allocating pool job from its original API receipt.
+
+    The jobs launch path keeps the requested pool and validates its binding;
+    it cannot fall back to creating an independent worker. Missing context or
+    mismatched receipts retain ordinary quota admission.
+    """
+    if (user_request.request_name !=
+            request_names.AdminPolicyRequestName.JOBS_LAUNCH or
+            user_request.user is None or
+            not common_utils.is_in_request_context()):
+        return False
+    request = api_requests.get_request(common_utils.get_current_request_id())
+    return (request is not None and request.name == 'sky.jobs.launch' and
+            request.user_id == user_request.user.id and
+            isinstance(request.request_body, payloads.JobsLaunchBody) and
+            bool(request.request_body.pool))
 
 
 def _cluster_records() -> List[Dict[str, Any]]:
@@ -451,6 +474,8 @@ class TPUQuotaPolicy(admin_policy.AdminPolicy):
             task=user_request.task,
             skypilot_config=user_request.skypilot_config)
         if user_request.at_client_side:
+            return passthrough
+        if _is_pool_job_request(user_request):
             return passthrough
         gated = user_request.request_name in _GATED_REQUESTS
         defines_workers = (user_request.request_name
