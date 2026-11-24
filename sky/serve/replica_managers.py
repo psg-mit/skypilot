@@ -1628,7 +1628,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                 else:
                     # TODO(tian): This might take a lot of time. Shouldn't
                     # blocking probe to other replicas.
-                    is_preempted = self._handle_preemption(info)
+                    try:
+                        is_preempted = self._handle_preemption(info)
+                    except Exception as e:  # pylint: disable=broad-except
+                        # An unresolved provider/ownership check retains this
+                        # replica. Healthy peers still need their successful
+                        # setup probes published in the same pass.
+                        logger.error(
+                            f'Preemption reconciliation failed for replica '
+                            f'{info.replica_id}; retaining its ownership: '
+                            f'{common_utils.format_exception(e)}')
+                        continue
                     if is_preempted:
                         continue
 

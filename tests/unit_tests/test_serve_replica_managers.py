@@ -16,6 +16,15 @@ from sky.utils import common_utils
 from sky.utils import thread_utils
 
 
+@pytest.fixture(autouse=True)
+def isolate_alias_receipts(monkeypatch):
+    """Replica-manager unit tests must not read the user's native state."""
+    monkeypatch.setattr(replica_managers.pool_alias, 'pending_intents',
+                        lambda *_: [])
+    monkeypatch.setattr(replica_managers.pool_alias, 'retired_replica_ids',
+                        lambda *_: [])
+
+
 class TestSkyPilotReplicaManagerInitOrdering:
     """`SkyPilotReplicaManager.__init__` must run `_recover_replica_operations`
     BEFORE starting the `_job_status_fetcher` / `_thread_pool_refresher` /
@@ -203,6 +212,33 @@ def test_completed_launch_with_pending_record_is_collected(
     assert manager._terminate_replica.call_count == int(failed)
 
 
+def test_failed_preemption_reconciliation_does_not_block_ready_peer(
+        thread_pool_manager, monkeypatch):
+    manager, failed = thread_pool_manager
+    ready = replica_managers.ReplicaInfo(2, 'pool-2', '-', False, None, 1, None)
+    for info in (failed, ready):
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+    manager._uptime = None
+    manager._handle_preemption = mock.Mock(
+        side_effect=RuntimeError('TPU teardown ownership mismatch'))
+    monkeypatch.setattr(replica_managers.serve_state, 'get_replica_infos',
+                        lambda *_: [failed, ready])
+    monkeypatch.setattr(replica_managers.serve_state, 'set_service_uptime',
+                        mock.Mock())
+    monkeypatch.setattr(replica_managers.ReplicaInfo, 'probe_pool', lambda info:
+                        (info, info.replica_id == 2, 100.0))
+    persist = replica_managers.serve_state.add_or_update_replica
+
+    manager._probe_all_replicas()
+
+    manager._handle_preemption.assert_called_once_with(failed)
+    manager._terminate_replica.assert_not_called()
+    persist.assert_called_once_with('pool', 2, ready)
+    assert ready.status_property.service_ready_now
+    assert ready.status_property.first_ready_time == 100.0
+
+
 def test_unstarted_launch_with_provisioning_record_starts_once(
         thread_pool_manager):
     manager, info = thread_pool_manager
@@ -315,8 +351,8 @@ def test_recover_failed_worker_teardown_preserves_logs(monkeypatch, tmp_path,
                                         None)
     info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
     info.status_property.sky_down_status = common_utils.ProcessStatus.RUNNING
-    assert (info.status ==
-            replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
+    assert (
+        info.status == replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
     launch_log = tmp_path / 'launch.log'
     retained_log = tmp_path / 'replica.log'
     retained_log.write_text('previous attempt\n')
