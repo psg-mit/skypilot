@@ -239,7 +239,15 @@ def _is_permission_satisfied(service_account, crm, iam, required_permissions,
     member_id = 'serviceAccount:' + email
 
     required_permissions = set(required_permissions)
-    policy = crm.projects().getIamPolicy(resource=project_id, body={}).execute()
+    # Version 1 replaces conditional roles with synthetic ``_withcond_``
+    # names, which cannot be resolved through roles.get(). Preserve conditions
+    # both when checking grants and when returning a policy for an IAM update.
+    policy = crm.projects().getIamPolicy(resource=project_id,
+                                         body={
+                                             'options': {
+                                                 'requestedPolicyVersion': 3
+                                             }
+                                         }).execute()
     original_policy = copy.deepcopy(policy)
     already_configured = True
 
@@ -250,6 +258,8 @@ def _is_permission_satisfied(service_account, crm, iam, required_permissions,
     for role in required_roles:
         role_exists = False
         for binding in policy['bindings']:
+            if binding.get('condition'):
+                continue
             if binding['role'] == role:
                 if member_id not in binding['members']:
                     logger.info(f'_configure_iam_role: role {role} is not '
@@ -282,6 +292,10 @@ def _is_permission_satisfied(service_account, crm, iam, required_permissions,
     # simplicity as it can be granted at the service account level.
     def check_permissions(policy, required_permissions):
         for binding in policy['bindings']:
+            # A resource-scoped grant does not satisfy the VM service account's
+            # unconditional provisioning requirements.
+            if binding.get('condition'):
+                continue
             if member_id in binding['members']:
                 role = binding['role']
                 logger.info(f'_configure_iam_role: role {role} is attached to '
