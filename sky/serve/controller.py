@@ -2,6 +2,7 @@
 
 Responsible for autoscaling and replica management.
 """
+import collections
 import contextlib
 import logging
 import os
@@ -83,7 +84,11 @@ class SkyServeController:
                 assert record is not None, ('No service record found for '
                                             f'{self._service_name}')
                 active_versions = record['active_versions']
-                logger.info(f'All replica info for autoscaler: {replica_infos}')
+                logger.info(
+                    'Replica status counts for autoscaler: %s',
+                    dict(
+                        collections.Counter(
+                            info.status.value for info in replica_infos)))
 
                 # Autoscaler now extracts GPU type info directly from
                 # replica_infos in generate_scaling_decisions method

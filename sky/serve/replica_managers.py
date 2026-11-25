@@ -364,10 +364,6 @@ class ReplicaStatusProperty:
         ready for the current version.
         """
         replica_status = self.to_replica_status()
-        logger.info(
-            'Check replica unrecorverable: first_ready_time '
-            f'{self.first_ready_time}, user_app_failed {self.user_app_failed}, '
-            f'status {replica_status}')
         if replica_status not in serve_state.ReplicaStatus.terminal_statuses():
             return False
         if self.first_ready_time is not None:
