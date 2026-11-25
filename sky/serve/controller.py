@@ -261,6 +261,8 @@ class SkyServeController:
                     })
 
             if (replica_status in serve_state.ReplicaStatus.failed_statuses()
+                    and
+                    replica_status != serve_state.ReplicaStatus.FAILED_CLEANUP
                     and not purge):
                 return responses.JSONResponse(
                     status_code=409,
