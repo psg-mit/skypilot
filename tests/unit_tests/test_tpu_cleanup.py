@@ -271,6 +271,44 @@ def test_controller_rechecks_with_durable_error_and_backoff(case):
 
 
 @pytest.mark.parametrize('status', [
+    cleanup.job_state.ManagedJobStatus.PENDING,
+    cleanup.job_state.ManagedJobStatus.STARTING,
+    cleanup.job_state.ManagedJobStatus.RECOVERING,
+])
+def test_unassigned_waiting_jobs_do_not_block_terminal_cleanup(
+        case, monkeypatch, status):
+    case.jobs[None] = [123]
+    monkeypatch.setattr(cleanup.job_state, 'get_status', lambda _: status)
+    monkeypatch.setattr(cleanup.job_state, 'get_pool_submit_info', lambda _:
+                        (None, None))
+    cleanup.reconcile_allocation(case.path)
+    case.api.queuedResources().delete.assert_called_once_with(name=case.name,
+                                                              force=True)
+    case.api.operations().get.return_value.execute.return_value = {'done': True}
+    case.resources.clear()
+    cleanup.reconcile_allocation(case.path)
+    assert cleanup.queue.load(case.path)['stage'] == 'retired'
+    assert case.jobs == {None: [123]}
+
+
+@pytest.mark.parametrize('status,binding', [
+    (cleanup.job_state.ManagedJobStatus.RUNNING, (None, None)),
+    (cleanup.job_state.ManagedJobStatus.STARTING, (None, 42)),
+    (cleanup.job_state.ManagedJobStatus.STARTING, ('successor', None)),
+    (None, (None, None)),
+])
+def test_ambiguous_unassigned_job_still_blocks_cleanup(case, monkeypatch,
+                                                       status, binding):
+    case.jobs[None] = [123]
+    monkeypatch.setattr(cleanup.job_state, 'get_status', lambda _: status)
+    monkeypatch.setattr(cleanup.job_state, 'get_pool_submit_info',
+                        lambda _: binding)
+    with pytest.raises(ValueError, match='unresolved job assignment'):
+        cleanup.reconcile_allocation(case.path)
+    case.api.queuedResources().delete.assert_not_called()
+
+
+@pytest.mark.parametrize('status', [
     cleanup.serve_state.ReplicaStatus.READY,
     cleanup.serve_state.ReplicaStatus.NOT_READY
 ])

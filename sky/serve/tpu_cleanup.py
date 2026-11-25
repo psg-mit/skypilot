@@ -137,8 +137,18 @@ def _owner_fence(value: dict) -> PoolAllocationOwner:
                     replica.status.value in ('READY', 'NOT_READY')):
         raise ValueError('Pool worker is still eligible for work')
     jobs = job_state.get_nonterminal_job_ids_by_pool_grouped(owner.service_name)
-    if jobs.get(owner.native_name) or jobs.get(None):
+    if jobs.get(owner.native_name):
         raise ValueError('Pool worker still has assigned work')
+    for job_id in jobs.get(None, []):
+        # The service scheduling lock fences assignment while cleanup runs.
+        # Jobs still waiting for a worker do not use this terminal allocation;
+        # an unbound running job or a retained submit ID remains ambiguous.
+        if (job_state.get_status(job_id) not in {
+                job_state.ManagedJobStatus.PENDING,
+                job_state.ManagedJobStatus.STARTING,
+                job_state.ManagedJobStatus.RECOVERING,
+        } or job_state.get_pool_submit_info(job_id) != (None, None)):
+            raise ValueError('Pool has an unresolved job assignment')
     for other in api_requests.get_request_tasks(
             api_requests.RequestTaskFilter(
                 cluster_names=[owner.native_name],
